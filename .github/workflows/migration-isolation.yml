@@ -81,7 +81,7 @@ jobs:
 
           echo "Migration-only PR -- check passed."
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         if: steps.migration_check.outputs.has_sql_migration == 'true'
         with:
           node-version: 22

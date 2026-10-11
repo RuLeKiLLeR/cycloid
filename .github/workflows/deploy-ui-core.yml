@@ -119,7 +119,7 @@ jobs:
             echo "origin=$origin"
           } >> "$GITHUB_OUTPUT"
           echo "Deploy target: project=$project branch=$branch env_tag=$env_tag origin=$origin"
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
