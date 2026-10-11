@@ -96,12 +96,12 @@
   },
   "homepage": "https://github.com/trycycloid/cycloid#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@slack/web-api": "^7.8.0",
-    "freestyle": "^0.1.63",
-    "smol-toml": "^1.7.0",
-    "tsx": "^4.21.0",
-    "zod": "^4.3.6"
+    "freestyle": "^0.2.16",
+    "smol-toml": "^1.9.0",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.110.0",
@@ -127,6 +127,6 @@
     "typescript": "^5.9.3",
     "vitest": "^4.1.9",
     "wrangler": "^4.107.0",
-    "yaml": "^2.8.3"
+    "yaml": "^2.9.1"
   }
 }

@@ -7,6 +7,6 @@
     "ready-check": "bash ready-check.sh"
   },
   "dependencies": {
-    "e2b": "^2.32.0"
+    "e2b": "^2.53.1"
   }
 }
