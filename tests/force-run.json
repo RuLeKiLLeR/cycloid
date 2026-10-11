@@ -1,0 +1,25 @@
+[
+  {
+    "source": ["apps/control-plane-worker/migrations/**"],
+    "tests": ["tests/test_cloudflare/schema-validation.test.ts"]
+  },
+  {
+    "source": [".github/workflows/**"],
+    "tests": ["tests/test_agent/*-workflow.test.ts"]
+  },
+  {
+    "source": [
+      "tests/test_sandbox-bridge/prompt-golden/goldens/**",
+      "tests/test_sandbox-bridge/prompt-golden/fixtures.ts"
+    ],
+    "tests": ["tests/test_sandbox-bridge/prompt-golden/prompt-golden.test.ts"]
+  },
+  {
+    "source": ["scripts/frontend-audit/**"],
+    "tests": ["tests/test_scripts/frontend-audit.test.ts"]
+  },
+  {
+    "source": ["tests/force-run.json", "scripts/force-run-tests.mjs", "tests/test_scripts/force-run-tests.test.ts"],
+    "tests": ["tests/test_scripts/force-run-tests.test.ts"]
+  }
+]

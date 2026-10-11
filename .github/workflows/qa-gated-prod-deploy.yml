@@ -1,0 +1,412 @@
+name: QA-Gated Production Deploy
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/deploy.yml
+      - .github/workflows/deploy-ui-core.yml
+      - .github/workflows/deploy-control-plane.yml
+      - .github/workflows/deploy-control-plane-core.yml
+      - .github/workflows/deploy-control-plane-qa.yml
+      - .github/workflows/deploy-e2b-sandbox.yml
+      - .github/workflows/deploy-e2b-sandbox-core.yml
+      - .github/workflows/deploy-e2b-sandbox-qa.yml
+      - .github/workflows/deploy-frontend-qa.yml
+      - .github/workflows/qa-gated-prod-deploy.yml
+      - apps/control-plane-worker/**
+      - apps/sandbox-bridge/**
+      - apps/sandbox-e2b/**
+      - apps/ui/**
+      - infra/ssm.tf
+      - package.json
+      - package-lock.json
+      - scripts/cloudflare-benchmark-gate.mjs
+      - scripts/detect-deploy-surfaces.mjs
+      - scripts/e2b-template-build.sh
+      - scripts/ensure-cloudflare-r2-buckets.sh
+      - scripts/inspect-ui-public-artifact.mjs
+      - scripts/publish-bridge-bundle.mjs
+      - shared/**
+      - tools/**
+      - tools.toml
+permissions:
+  contents: read
+  id-token: write
+  statuses: read
+  pull-requests: read
+concurrency:
+  group: qa-gated-prod-deploy
+  cancel-in-progress: false
+jobs:
+  detect-surfaces:
+    name: Detect affected deploy surfaces
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      ui: ${{ steps.surfaces.outputs.ui }}
+      control: ${{ steps.surfaces.outputs.control }}
+      sandbox: ${{ steps.surfaces.outputs.sandbox }}
+      ssm: ${{ steps.surfaces.outputs.ssm }}
+      skip: ${{ steps.surfaces.outputs.skip }}
+      base_sha: ${{ steps.surfaces.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect affected deploy surfaces
+        id: surfaces
+        env:
+          PROD_DEPLOYED_REF: prod-deployed
+          SHA: ${{ github.sha }}
+        run: node scripts/detect-deploy-surfaces.mjs
+  qa-control:
+    name: QA Control Plane
+    needs:
+      - detect-surfaces
+    if: ${{ needs.detect-surfaces.outputs.skip != 'true' && needs.detect-surfaces.outputs.control == 'true' }}
+    uses: ./.github/workflows/deploy-control-plane-core.yml
+    permissions:
+      contents: read
+      id-token: write
+      statuses: read
+    with:
+      ref: ${{ github.sha }}
+      environment: qa
+      force_deploy: false
+      sync_secrets: true
+      wait_for_tfc: false
+      notify_slack: false
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  qa-sandbox:
+    name: QA E2B Sandbox
+    needs:
+      - detect-surfaces
+    if: ${{ needs.detect-surfaces.outputs.skip != 'true' && needs.detect-surfaces.outputs.sandbox == 'true' }}
+    uses: ./.github/workflows/deploy-e2b-sandbox-core.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      ref: ${{ github.sha }}
+      environment: qa
+      skip_cache: false
+      notify_slack: false
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  qa-ui:
+    name: QA UI
+    needs:
+      - detect-surfaces
+    if: ${{ needs.detect-surfaces.outputs.skip != 'true' && needs.detect-surfaces.outputs.ui == 'true' }}
+    uses: ./.github/workflows/deploy-ui-core.yml
+    with:
+      ref: ${{ github.sha }}
+      environment: qa
+      notify_slack: false
+    secrets:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  qa-gate:
+    name: Require requested QA deploys
+    needs:
+      - detect-surfaces
+      - qa-control
+      - qa-sandbox
+      - qa-ui
+    if: ${{ always() && needs.detect-surfaces.outputs.skip != 'true' }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Fail if requested QA deploy failed
+        env:
+          CONTROL_REQUESTED: ${{ needs.detect-surfaces.outputs.control }}
+          SANDBOX_REQUESTED: ${{ needs.detect-surfaces.outputs.sandbox }}
+          UI_REQUESTED: ${{ needs.detect-surfaces.outputs.ui }}
+          QA_CONTROL_RESULT: ${{ needs.qa-control.result }}
+          QA_SANDBOX_RESULT: ${{ needs.qa-sandbox.result }}
+          QA_UI_RESULT: ${{ needs.qa-ui.result }}
+        run: |-
+          set -euo pipefail
+          failed=0
+          check_requested() {
+            local requested="$1" result="$2" name="$3"
+            if [ "$requested" = "true" ] && [ "$result" != "success" ]; then
+              echo "::error::$name was requested but result=$result"
+              failed=1
+            fi
+          }
+          check_requested "$CONTROL_REQUESTED" "$QA_CONTROL_RESULT" "QA control-plane deploy"
+          check_requested "$SANDBOX_REQUESTED" "$QA_SANDBOX_RESULT" "QA E2B deploy"
+          check_requested "$UI_REQUESTED" "$QA_UI_RESULT" "QA UI deploy"
+          if [ "$failed" -ne 0 ]; then exit 1; fi
+          echo "Requested QA deploys succeeded."
+  prod-control:
+    name: Prod Control Plane
+    needs:
+      - detect-surfaces
+      - qa-gate
+    if: ${{ always() && !cancelled() && needs.detect-surfaces.outputs.skip != 'true' && needs.qa-gate.result == 'success' && needs.detect-surfaces.outputs.control == 'true' }}
+    uses: ./.github/workflows/deploy-control-plane-core.yml
+    permissions:
+      contents: read
+      id-token: write
+      statuses: read
+    with:
+      ref: ${{ github.sha }}
+      environment: production
+      force_deploy: false
+      sync_secrets: ${{ needs.detect-surfaces.outputs.ssm == 'true' }}
+      wait_for_tfc: ${{ needs.detect-surfaces.outputs.ssm == 'true' }}
+      notify_slack: false
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  prod-sandbox:
+    name: Prod E2B Sandbox
+    needs:
+      - detect-surfaces
+      - qa-gate
+    if: ${{ always() && !cancelled() && needs.detect-surfaces.outputs.skip != 'true' && needs.qa-gate.result == 'success' && needs.detect-surfaces.outputs.sandbox == 'true' }}
+    uses: ./.github/workflows/deploy-e2b-sandbox-core.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      ref: ${{ github.sha }}
+      environment: production
+      force_rebuild: false
+      run_template_build: true
+      register_base_templates: false
+      notify_slack: false
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  prod-sandbox-register:
+    name: Prod E2B Sandbox Registration
+    needs:
+      - detect-surfaces
+      - qa-gate
+      - prod-sandbox
+      - prod-control
+    if: ${{ always() && !cancelled() && needs.detect-surfaces.outputs.skip != 'true' && needs.qa-gate.result == 'success' && needs.detect-surfaces.outputs.sandbox == 'true' && needs.prod-sandbox.result == 'success' && (needs.detect-surfaces.outputs.control != 'true' || needs.prod-control.result == 'success') }}
+    uses: ./.github/workflows/deploy-e2b-sandbox-core.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      ref: ${{ github.sha }}
+      environment: production
+      force_rebuild: false
+      run_template_build: false
+      register_base_templates: true
+      notify_slack: false
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  prod-ui:
+    name: Prod UI
+    needs:
+      - detect-surfaces
+      - qa-gate
+      - prod-control
+    if: ${{ always() && !cancelled() && needs.detect-surfaces.outputs.skip != 'true' && needs.qa-gate.result == 'success' && needs.detect-surfaces.outputs.ui == 'true' && (needs.detect-surfaces.outputs.control != 'true' || needs.prod-control.result == 'success') }}
+    uses: ./.github/workflows/deploy-ui-core.yml
+    with:
+      ref: ${{ github.sha }}
+      environment: production
+      notify_slack: false
+    secrets:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+  notify-success:
+    name: Notify Slack on successful grouped deploy
+    needs:
+      - detect-surfaces
+      - qa-control
+      - qa-sandbox
+      - qa-ui
+      - qa-gate
+      - prod-control
+      - prod-sandbox
+      - prod-sandbox-register
+      - prod-ui
+    if: ${{ always() && needs.detect-surfaces.outputs.skip != 'true' && needs.detect-surfaces.result == 'success' && needs.qa-gate.result == 'success' && (needs.detect-surfaces.outputs.control != 'true' || needs.prod-control.result == 'success') && (needs.detect-surfaces.outputs.sandbox != 'true' || (needs.prod-sandbox.result == 'success' && needs.prod-sandbox-register.result == 'success')) && (needs.detect-surfaces.outputs.ui != 'true' || needs.prod-ui.result == 'success') }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Notify Slack on successful grouped deploy
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CONTROL_DEPLOYED: ${{ needs.detect-surfaces.outputs.control }}
+          SANDBOX_DEPLOYED: ${{ needs.detect-surfaces.outputs.sandbox }}
+          UI_DEPLOYED: ${{ needs.detect-surfaces.outputs.ui }}
+          BASE_SHA: ${{ needs.detect-surfaces.outputs.base_sha }}
+        run: |-
+          set -euo pipefail
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          SHORT_SHA="${SHA::7}"
+          RANGE_TEXT=""
+          if [ -n "$BASE_SHA" ]; then RANGE_TEXT=" · ${BASE_SHA::7}..$SHORT_SHA"; fi
+          SUBJECT="$(git log -1 --format=%s "$SHA" 2>/dev/null || true)"
+          if [ -z "$SUBJECT" ] && [ -n "$HEAD_COMMIT_MESSAGE" ]; then SUBJECT="${HEAD_COMMIT_MESSAGE%%$'\n'*}"; fi
+          SUBJECT="${SUBJECT:-$SHORT_SHA}"
+          SUBJECT="$(printf '%s' "$SUBJECT" | cut -c1-72 | sed -e 's/[`*_~]/ /g' -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/  */ /g')"
+          PR="$(gh api "repos/${REPO}/commits/${SHA}/pulls" -H "Accept: application/vnd.github+json" --jq '.[0].number // ""' 2>/dev/null || true)"
+          CHANGE="$SUBJECT"
+          if [ -n "$PR" ]; then CHANGE="#${PR} ${SUBJECT}"; fi
+          surfaces=()
+          if [ "$CONTROL_DEPLOYED" = "true" ]; then surfaces+=("API"); fi
+          if [ "$SANDBOX_DEPLOYED" = "true" ]; then surfaces+=("E2B Sandbox"); fi
+          if [ "$UI_DEPLOYED" = "true" ]; then surfaces+=("UI"); fi
+          SURFACE_LIST="$(IFS=", "; echo "${surfaces[*]}")"
+          PAYLOAD=$(jq -n --arg text ":white_check_mark: *QA + PROD deploy* · ${SURFACE_LIST:-workflow-only} · ${CHANGE} · ${ACTOR}${RANGE_TEXT} · <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> · <${RUN_URL}|run>" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD"
+  advance-prod-deployed-marker:
+    name: Advance prod deployed marker
+    needs:
+      - detect-surfaces
+      - qa-control
+      - qa-sandbox
+      - qa-ui
+      - qa-gate
+      - prod-control
+      - prod-sandbox
+      - prod-sandbox-register
+      - prod-ui
+    if: ${{ always() && needs.detect-surfaces.outputs.skip != 'true' && needs.detect-surfaces.result == 'success' && needs.qa-gate.result == 'success' && (needs.detect-surfaces.outputs.control != 'true' || needs.prod-control.result == 'success') && (needs.detect-surfaces.outputs.sandbox != 'true' || (needs.prod-sandbox.result == 'success' && needs.prod-sandbox-register.result == 'success')) && (needs.detect-surfaces.outputs.ui != 'true' || needs.prod-ui.result == 'success') }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Move prod deployed marker forward
+        env:
+          SHA: ${{ github.sha }}
+          BASE_SHA: ${{ needs.detect-surfaces.outputs.base_sha }}
+          MARKER_REF: prod-deployed
+        run: |-
+          set -euo pipefail
+
+          git fetch origin "refs/tags/${MARKER_REF}:refs/tags/${MARKER_REF}" --force || true
+          current_marker="$(git rev-parse --verify "${MARKER_REF}^{commit}" 2>/dev/null || true)"
+          short_sha="${SHA::7}"
+
+          if [ -n "$current_marker" ] && git merge-base --is-ancestor "$SHA" "$current_marker"; then
+            echo "prod-deployed already points at or ahead of ${short_sha}."
+            exit 0
+          fi
+
+          if [ -n "$current_marker" ] && ! git merge-base --is-ancestor "$current_marker" "$SHA"; then
+            echo "::error::prod-deployed (${current_marker}) is not an ancestor of ${SHA}; refusing to move marker backward or across histories."
+            exit 1
+          fi
+
+          git tag -f "$MARKER_REF" "$SHA"
+          git push origin "refs/tags/${MARKER_REF}" --force
+
+          range="$short_sha"
+          if [ -n "$BASE_SHA" ]; then range="${BASE_SHA::7}..$short_sha"; fi
+          {
+            echo "### Production deploy marker"
+            echo
+            echo "- Marker: \`${MARKER_REF}\`"
+            echo "- Deployed range: \`${range}\`"
+            echo "- Target SHA: \`${SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+  notify-failure:
+    name: Notify Slack on blocked production deploy
+    needs:
+      - detect-surfaces
+      - qa-control
+      - qa-sandbox
+      - qa-ui
+      - qa-gate
+      - prod-control
+      - prod-sandbox
+      - prod-sandbox-register
+      - prod-ui
+    if: ${{ always() && needs.detect-surfaces.outputs.skip != 'true' && (needs.detect-surfaces.result == 'failure' || needs.detect-surfaces.result == 'cancelled' || needs.qa-gate.result == 'failure' || needs.qa-gate.result == 'cancelled' || needs.prod-control.result == 'failure' || needs.prod-control.result == 'cancelled' || needs.prod-sandbox.result == 'failure' || needs.prod-sandbox.result == 'cancelled' || needs.prod-sandbox-register.result == 'failure' || needs.prod-sandbox-register.result == 'cancelled' || needs.prod-ui.result == 'failure' || needs.prod-ui.result == 'cancelled') }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Notify Slack on blocked production deploy
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CONTROL_DEPLOYED: ${{ needs.detect-surfaces.outputs.control }}
+          SANDBOX_DEPLOYED: ${{ needs.detect-surfaces.outputs.sandbox }}
+          UI_DEPLOYED: ${{ needs.detect-surfaces.outputs.ui }}
+          QA_CONTROL_RESULT: ${{ needs.qa-control.result }}
+          QA_SANDBOX_RESULT: ${{ needs.qa-sandbox.result }}
+          QA_UI_RESULT: ${{ needs.qa-ui.result }}
+          PROD_CONTROL_RESULT: ${{ needs.prod-control.result }}
+          PROD_SANDBOX_RESULT: ${{ needs.prod-sandbox.result }}
+          PROD_SANDBOX_REGISTER_RESULT: ${{ needs.prod-sandbox-register.result }}
+          PROD_UI_RESULT: ${{ needs.prod-ui.result }}
+        run: |-
+          set -euo pipefail
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          SHORT_SHA="${SHA::7}"
+          SUBJECT="$(git log -1 --format=%s "$SHA" 2>/dev/null || true)"
+          if [ -z "$SUBJECT" ] && [ -n "$HEAD_COMMIT_MESSAGE" ]; then SUBJECT="${HEAD_COMMIT_MESSAGE%%$'\n'*}"; fi
+          SUBJECT="${SUBJECT:-$SHORT_SHA}"
+          SUBJECT="$(printf '%s' "$SUBJECT" | cut -c1-72 | sed -e 's/[`*_~]/ /g' -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/  */ /g')"
+          PR="$(gh api "repos/${REPO}/commits/${SHA}/pulls" -H "Accept: application/vnd.github+json" --jq '.[0].number // ""' 2>/dev/null || true)"
+          CHANGE="$SUBJECT"
+          if [ -n "$PR" ]; then CHANGE="#${PR} ${SUBJECT}"; fi
+          surfaces=()
+          if [ "$CONTROL_DEPLOYED" = "true" ]; then surfaces+=("API"); fi
+          if [ "$SANDBOX_DEPLOYED" = "true" ]; then surfaces+=("E2B Sandbox"); fi
+          if [ "$UI_DEPLOYED" = "true" ]; then surfaces+=("UI"); fi
+          SURFACE_LIST="$(IFS=", "; echo "${surfaces[*]}")"
+          failed_service="unknown"
+          set_failed_service() {
+            local result="$1" name="$2"
+            if [ "$failed_service" = "unknown" ] && { [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; }; then
+              failed_service="$name"
+            fi
+          }
+          set_failed_service "$QA_CONTROL_RESULT" "QA API"
+          set_failed_service "$QA_SANDBOX_RESULT" "QA E2B Sandbox"
+          set_failed_service "$QA_UI_RESULT" "QA UI"
+          set_failed_service "$PROD_CONTROL_RESULT" "PROD API"
+          set_failed_service "$PROD_SANDBOX_RESULT" "PROD E2B Sandbox"
+          set_failed_service "$PROD_SANDBOX_REGISTER_RESULT" "PROD E2B Sandbox registration"
+          set_failed_service "$PROD_UI_RESULT" "PROD UI"
+          MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          PAYLOAD=$(jq -n --arg text ":x: *QA + PROD deploy blocked* · ${SURFACE_LIST:-workflow-only} · ${CHANGE} · ${ACTOR} · <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> · <${RUN_URL}|run>
+          Failed: ${failed_service}
+          QA gate or PROD deploy failed; production rollout did not complete.
+          ${MENTION}" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD"

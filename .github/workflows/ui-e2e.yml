@@ -1,0 +1,84 @@
+name: UI E2E
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/ui/**"
+      - "shared/**"
+      - "tests/test_ui/browser/**"
+      - "playwright.config.ts"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/ui-e2e.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Playwright browser smoke
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Cache node_modules
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        run: HUSKY=0 npm ci --no-audit --no-fund
+
+      # Cache the downloaded Chromium build so it isn't re-fetched every run.
+      # The install step below still runs to pull the `--with-deps` apt
+      # libraries (not cached), and re-validates/installs the browser if the
+      # cache missed.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          # Fall back to the latest prior Chromium cache when the lockfile hash
+          # changes for unrelated reasons; `playwright install` re-validates the
+          # restored binary and only skips the download if it's still compatible.
+          restore-keys: |
+            playwright-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Disable broken Microsoft apt repositories
+        run: |
+          sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -print0 \
+            | xargs -0 -r grep -l 'packages.microsoft.com' \
+            | xargs -r sudo rm -f
+
+      - name: Install Playwright Chromium
+        run: |
+          npx playwright install chromium
+          npx playwright install-deps chromium
+
+      - name: Run browser E2E suite
+        run: npx playwright test
+
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-results
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 7
+          if-no-files-found: ignore

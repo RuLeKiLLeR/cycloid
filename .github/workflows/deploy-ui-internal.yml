@@ -1,0 +1,63 @@
+name: Deploy Frontend (Internal)
+# Auto-deploys the UX-overhaul redesign branch to the cycloid-ui-internal
+# Cloudflare Pages project (internal.app.trycycloid.com), which points at the
+# PROD control plane (WORKER_HOST = api.trycycloid.com) via its Terraform-managed
+# deployment config. Reuses deploy-ui-core.yml's production path (build + R2 asset
+# upload + private-source-map verification) but retargets the Pages project,
+# deploy branch, and Sentry/Datadog env tag.
+on:
+  push:
+    branches:
+      - ux-overhaul-control-room
+    paths:
+      - .github/workflows/deploy-ui-core.yml
+      - .github/workflows/deploy-ui-internal.yml
+      - apps/ui/**
+      - scripts/inspect-ui-public-artifact.mjs
+      - shared/**
+      - package.json
+      - package-lock.json
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy to the internal frontend
+        required: true
+        default: ux-overhaul-control-room
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: deploy-ui-internal
+  cancel-in-progress: true
+jobs:
+  deploy:
+    name: Deploy Internal Frontend
+    uses: ./.github/workflows/deploy-ui-core.yml
+    with:
+      # Push events don't carry inputs.ref; fall back to the pushed ref so the
+      # auto-deploy builds the commit that triggered it.
+      ref: ${{ inputs.ref || github.ref_name }}
+      # Reuse the production path: build + R2 asset upload + private-source-map
+      # gate. The internal Pages project binds the same content-addressed
+      # cycloid-ui-assets R2 bucket, so uploading hashed assets is safe (hashed
+      # keys can't collide) and keeps the stale-tab fallback working for internal.
+      environment: production
+      pages_project_name: cycloid-ui-internal
+      # Must equal the cycloid-ui-internal project's production_branch
+      # (ux-overhaul-control-room) so wrangler treats the deploy as production and
+      # aliases it to the internal.app.trycycloid.com custom domain.
+      pages_branch: ux-overhaul-control-room
+      # Tag Sentry/Datadog as "internal" so internal errors don't page as prod.
+      # Sentry only reports when the env is "production", so internal builds stay
+      # silent in Sentry (intended); VITE_DD_ENV is left unset on this path.
+      env_tag: internal
+      notify_slack: ${{ inputs.notify_slack || false }}
+    secrets:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

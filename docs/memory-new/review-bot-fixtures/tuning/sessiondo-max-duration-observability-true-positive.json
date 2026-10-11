@@ -1,0 +1,89 @@
+{
+  "schema_version": "memory_review_bot_fixture_v1",
+  "fixture_id": "sessiondo-max-duration-observability-true-positive",
+  "fixture_source": "production",
+  "prompt": {
+    "session_id": "eed9c694-5bcf-408d-9b4e-e505d47252ff",
+    "prompt_id": "sessiondo-max-duration-observability",
+    "task_summary": "Add observability for SessionDO max-duration paths.",
+    "bounded_prompt": "Instrument the SessionDO max-duration workflow so operators can see when prompts are capped by duration and correlate it with terminal side effects.",
+    "outcome_summary": "The change added duration-limit telemetry and kept terminal-side-effect ordering intact."
+  },
+  "returned_memories": [
+    {
+      "memory_id": "mem-28b3e956",
+      "source": "recall",
+      "rank": 1,
+      "score": 0.91,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "SessionDO terminal side effects should run after prompt completion is finalized so downstream jobs observe the completed prompt state."
+    },
+    {
+      "memory_id": "mem-2e609b5a",
+      "source": "recall",
+      "rank": 2,
+      "score": 0.87,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Max-duration prompt handling needs explicit observability because timeout and duration-cap paths otherwise look like ordinary terminal completion in operations."
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "ev_prompt_duration_observability",
+      "kind": "prompt",
+      "source_ref": "prompt",
+      "snippet": "The prompt asked for SessionDO max-duration observability and correlation with terminal side effects."
+    },
+    {
+      "evidence_id": "ev_memory_terminal_ordering",
+      "kind": "memory",
+      "source_ref": "mem-28b3e956",
+      "snippet": "The returned memory identifies the completed-prompt ordering constraint for terminal side effects."
+    },
+    {
+      "evidence_id": "ev_memory_duration_caps",
+      "kind": "memory",
+      "source_ref": "mem-2e609b5a",
+      "snippet": "The returned memory identifies the need for explicit observability around max-duration prompt handling."
+    },
+    {
+      "evidence_id": "ev_output_pr_3358",
+      "kind": "output",
+      "source_ref": "PR #3358",
+      "snippet": "The output added duration-limit telemetry while preserving completed-prompt terminal side-effect ordering."
+    }
+  ],
+  "expected": {
+    "prompt_outcome": "true_positive",
+    "evidence_ids": [
+      "ev_prompt_duration_observability",
+      "ev_memory_terminal_ordering",
+      "ev_memory_duration_caps",
+      "ev_output_pr_3358"
+    ],
+    "memory_results": [
+      {
+        "memory_id": "mem-28b3e956",
+        "relevance": "relevant",
+        "usefulness": "useful",
+        "effect": "helped",
+        "lifecycle_state": "active",
+        "root_causes": [],
+        "evidence_ids": ["ev_prompt_duration_observability", "ev_memory_terminal_ordering", "ev_output_pr_3358"],
+        "rationale": "The terminal side-effect ordering memory directly constrained how the observability change could be safely integrated."
+      },
+      {
+        "memory_id": "mem-2e609b5a",
+        "relevance": "relevant",
+        "usefulness": "useful",
+        "effect": "helped",
+        "lifecycle_state": "active",
+        "root_causes": [],
+        "evidence_ids": ["ev_prompt_duration_observability", "ev_memory_duration_caps", "ev_output_pr_3358"],
+        "rationale": "The duration-cap observability memory matched the prompt and helped guide the implementation."
+      }
+    ]
+  }
+}

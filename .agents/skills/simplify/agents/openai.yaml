@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simplify"
+  short_description: "Simplify the current PR or local delta"
+  default_prompt: "Use $simplify to simplify the current branch's PR or local code changes without changing behavior."

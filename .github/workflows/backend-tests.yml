@@ -1,0 +1,332 @@
+name: Backend Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  # Per-PR group on a pull_request; per-commit group on push to main. Keying push
+  # runs on github.sha (not github.ref) gives every main commit its own group, so
+  # rapid successive merges no longer share one group and evict each other's
+  # pending runs -- each commit's post-merge full suite runs to completion.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  # Cancel only superseded PR runs. With per-commit push groups this is moot for
+  # push (no collisions), but keep it scoped to pull_request so a flat `true`
+  # never cancels a push-to-main run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Two shard jobs plus a single always-running aggregate job named `test`
+  # (the required ruleset check).
+  #
+  # Runs the FULL backend suite on every backend-relevant PR (and on push to main
+  # as a post-merge backstop). The old affected-subset strategy
+  # (`vitest --changed <base sha>`) let regressions the PR's import graph missed
+  # (dynamic imports, non-import coupling, leaked vi.mock registrations) merge
+  # green and only surface on the post-merge run. Running everything on the PR
+  # closes that gap; the PR-latency cost is the accepted tradeoff. The per-file
+  # fork+import cost across the ~650-file suite is the structural bottleneck, so
+  # the suite is split across two 4-core arm64 runners with --maxWorkers=4 per
+  # shard. That keeps Vitest at a 1:1 workers-to-cores ratio: threads segfault
+  # on native bindings, and oversubscribing cores causes dynamic-import timeouts.
+  #
+  # Fail closed: the detection step runs before any gate with no `if`, so a
+  # thrown API error fails the job (red required check, never pass-open). A
+  # truncated PR file list, or any non-PR event, forces backend_changed=true so
+  # the full suite runs rather than skipping.
+  test-shard-1:
+    runs-on: arm-4core
+    steps:
+      - name: Detect backend-relevant changes
+        id: changes
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Non-PR events (push to main backstop) always run the full suite.
+            if (context.eventName !== "pull_request") {
+              core.setOutput("backend_changed", "true");
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.flatMap((file) =>
+              file.previous_filename
+                ? [file.filename, file.previous_filename]
+                : [file.filename],
+            );
+            core.info(`Changed files:\n${changedFiles.join("\n")}`);
+
+            const reportedChangedFiles = context.payload.pull_request.changed_files;
+            const fileListTruncated =
+              Number.isInteger(reportedChangedFiles) &&
+              reportedChangedFiles > files.length;
+            if (fileListTruncated) {
+              core.warning(
+                `PR reports ${reportedChangedFiles} changed files but only ${files.length} were retrieved; running the backend suite fail-closed.`,
+              );
+            }
+
+            // Backend relevance: backend app/shared/config changes, repo-root
+            // instruction files, dogfood runtime config, and docs guarded by
+            // backend-owned parity tests, plus anything under tests/ that
+            // isn't exclusively UI (vitest). The tests/ catch-all is
+            // deliberate -- unclassified new tests/test_*/ directories default
+            // to running here, so CI fails closed.
+            const backendPattern =
+              /^(AGENTS\.md$|CLAUDE\.md$|agents\.md$|Dockerfile\.dogfood-runtime$|docker-compose\.yml$|\.cycloid\.json$|docs\/|apps\/(cli|control-plane-worker|sandbox-bridge)\/|scripts\/(cycloid-auth\.mjs|dogfood-(e2e|runtime)\.sh|dogfood-(healthcheck|preflight)\.mjs)|shared\/|tools\/|tools\.toml$|tests\/|package\.json$|package-lock\.json$|vitest(\..+)?\.config\.ts$|tsconfig\.json$|\.github\/workflows\/(backend-tests|request-reviewer)\.yml$)/;
+            const nonBackendTestsPattern = /^tests\/test_ui\//;
+            const backendChanged =
+              fileListTruncated ||
+              changedFiles.some(
+                (file) =>
+                  backendPattern.test(file) &&
+                  !nonBackendTestsPattern.test(file),
+              );
+
+            // fileListTruncated already forces backendChanged=true above, so a
+            // PR whose file list GitHub truncated still runs the full suite
+            // (fail closed toward more coverage) instead of skipping.
+            core.setOutput("backend_changed", String(backendChanged));
+
+      - uses: actions/checkout@v7
+        if: steps.changes.outputs.backend_changed == 'true'
+        # Default ref: on a PR this is GitHub's refs/pull/N/merge merge commit, so
+        # the full suite tests the PR merged into the target branch (catches
+        # integration breaks a head-only checkout would miss); on push it is the
+        # pushed commit. The full suite needs no base commit, so no `ref` override
+        # or fetch-depth.
+      - uses: actions/setup-node@v6
+        if: steps.changes.outputs.backend_changed == 'true'
+        with:
+          node-version: 22
+      - name: Cache node_modules
+        if: steps.changes.outputs.backend_changed == 'true'
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+      - name: Install dependencies
+        if: steps.changes.outputs.backend_changed == 'true' && steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Report runner core count
+        if: steps.changes.outputs.backend_changed == 'true'
+        run: echo "nproc=$(nproc)"
+      - name: Run backend test shard 1
+        if: steps.changes.outputs.backend_changed == 'true'
+        run: npx vitest run --shard=1/2 --maxWorkers=4 --exclude "tests/test_ui/**" --exclude "tests/test_workerd/**"
+      - name: Skip backend tests when irrelevant
+        if: steps.changes.outputs.backend_changed != 'true'
+        run: echo "No backend-relevant changes detected; backend tests skipped."
+
+  test-shard-2:
+    runs-on: arm-4core
+    steps:
+      - name: Detect backend-relevant changes
+        id: changes
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Non-PR events (push to main backstop) always run the full suite.
+            if (context.eventName !== "pull_request") {
+              core.setOutput("backend_changed", "true");
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.flatMap((file) =>
+              file.previous_filename
+                ? [file.filename, file.previous_filename]
+                : [file.filename],
+            );
+            core.info(`Changed files:\n${changedFiles.join("\n")}`);
+
+            const reportedChangedFiles = context.payload.pull_request.changed_files;
+            const fileListTruncated =
+              Number.isInteger(reportedChangedFiles) &&
+              reportedChangedFiles > files.length;
+            if (fileListTruncated) {
+              core.warning(
+                `PR reports ${reportedChangedFiles} changed files but only ${files.length} were retrieved; running the backend suite fail-closed.`,
+              );
+            }
+
+            // Backend relevance: backend app/shared/config changes, repo-root
+            // instruction files, dogfood runtime config, and docs guarded by
+            // backend-owned parity tests, plus anything under tests/ that
+            // isn't exclusively UI (vitest). The tests/ catch-all is
+            // deliberate -- unclassified new tests/test_*/ directories default
+            // to running here, so CI fails closed.
+            const backendPattern =
+              /^(AGENTS\.md$|CLAUDE\.md$|agents\.md$|Dockerfile\.dogfood-runtime$|docker-compose\.yml$|\.cycloid\.json$|docs\/|apps\/(cli|control-plane-worker|sandbox-bridge)\/|scripts\/(cycloid-auth\.mjs|dogfood-(e2e|runtime)\.sh|dogfood-(healthcheck|preflight)\.mjs)|shared\/|tools\/|tools\.toml$|tests\/|package\.json$|package-lock\.json$|vitest(\..+)?\.config\.ts$|tsconfig\.json$|\.github\/workflows\/(backend-tests|request-reviewer)\.yml$)/;
+            const nonBackendTestsPattern = /^tests\/test_ui\//;
+            const backendChanged =
+              fileListTruncated ||
+              changedFiles.some(
+                (file) =>
+                  backendPattern.test(file) &&
+                  !nonBackendTestsPattern.test(file),
+              );
+
+            // fileListTruncated already forces backendChanged=true above, so a
+            // PR whose file list GitHub truncated still runs the full suite
+            // (fail closed toward more coverage) instead of skipping.
+            core.setOutput("backend_changed", String(backendChanged));
+
+      - uses: actions/checkout@v7
+        if: steps.changes.outputs.backend_changed == 'true'
+        # Default ref: on a PR this is GitHub's refs/pull/N/merge merge commit, so
+        # the full suite tests the PR merged into the target branch (catches
+        # integration breaks a head-only checkout would miss); on push it is the
+        # pushed commit. The full suite needs no base commit, so no `ref` override
+        # or fetch-depth.
+      - uses: actions/setup-node@v6
+        if: steps.changes.outputs.backend_changed == 'true'
+        with:
+          node-version: 22
+      - name: Cache node_modules
+        if: steps.changes.outputs.backend_changed == 'true'
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+      - name: Install dependencies
+        if: steps.changes.outputs.backend_changed == 'true' && steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Report runner core count
+        if: steps.changes.outputs.backend_changed == 'true'
+        run: echo "nproc=$(nproc)"
+      - name: Run backend test shard 2
+        if: steps.changes.outputs.backend_changed == 'true'
+        run: npx vitest run --shard=2/2 --maxWorkers=4 --exclude "tests/test_ui/**" --exclude "tests/test_workerd/**"
+      - name: Skip backend tests when irrelevant
+        if: steps.changes.outputs.backend_changed != 'true'
+        run: echo "No backend-relevant changes detected; backend tests skipped."
+
+  test:
+    runs-on: ubuntu-24.04-arm
+    needs: [test-shard-1, test-shard-2]
+    if: always()
+    steps:
+      - name: Verify backend test shards
+        env:
+          SHARD_1_RESULT: ${{ needs.test-shard-1.result }}
+          SHARD_2_RESULT: ${{ needs.test-shard-2.result }}
+        run: |
+          echo "test-shard-1 result: $SHARD_1_RESULT"
+          echo "test-shard-2 result: $SHARD_2_RESULT"
+          if [[ "$SHARD_1_RESULT" == "success" && "$SHARD_2_RESULT" == "success" ]]; then
+            exit 0
+          fi
+          echo "One or more backend test shards failed, were cancelled, or were skipped unexpectedly."
+          exit 1
+
+  workerd:
+    runs-on: arm-4core
+    steps:
+      - name: Detect backend-relevant changes
+        id: changes
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Non-PR events (push to main backstop) always run the full suite.
+            if (context.eventName !== "pull_request") {
+              core.setOutput("backend_changed", "true");
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.flatMap((file) =>
+              file.previous_filename
+                ? [file.filename, file.previous_filename]
+                : [file.filename],
+            );
+            core.info(`Changed files:\n${changedFiles.join("\n")}`);
+
+            const reportedChangedFiles = context.payload.pull_request.changed_files;
+            const fileListTruncated =
+              Number.isInteger(reportedChangedFiles) &&
+              reportedChangedFiles > files.length;
+            if (fileListTruncated) {
+              core.warning(
+                `PR reports ${reportedChangedFiles} changed files but only ${files.length} were retrieved; running the backend suite fail-closed.`,
+              );
+            }
+
+            // Backend relevance: backend app/shared/config changes, repo-root
+            // instruction files, dogfood runtime config, and docs guarded by
+            // backend-owned parity tests, plus anything under tests/ that
+            // isn't exclusively UI (vitest). The tests/ catch-all is
+            // deliberate -- unclassified new tests/test_*/ directories default
+            // to running here, so CI fails closed.
+            const backendPattern =
+              /^(AGENTS\.md$|CLAUDE\.md$|agents\.md$|Dockerfile\.dogfood-runtime$|docker-compose\.yml$|\.cycloid\.json$|docs\/|apps\/(cli|control-plane-worker|sandbox-bridge)\/|scripts\/(cycloid-auth\.mjs|dogfood-(e2e|runtime)\.sh|dogfood-(healthcheck|preflight)\.mjs)|shared\/|tools\/|tools\.toml$|tests\/|package\.json$|package-lock\.json$|vitest(\..+)?\.config\.ts$|tsconfig\.json$|\.github\/workflows\/(backend-tests|request-reviewer)\.yml$)/;
+            const nonBackendTestsPattern = /^tests\/test_ui\//;
+            const backendChanged =
+              fileListTruncated ||
+              changedFiles.some(
+                (file) =>
+                  backendPattern.test(file) &&
+                  !nonBackendTestsPattern.test(file),
+              );
+
+            // fileListTruncated already forces backendChanged=true above, so a
+            // PR whose file list GitHub truncated still runs the full suite
+            // (fail closed toward more coverage) instead of skipping.
+            core.setOutput("backend_changed", String(backendChanged));
+
+      - uses: actions/checkout@v7
+        if: steps.changes.outputs.backend_changed == 'true'
+      - uses: actions/setup-node@v6
+        if: steps.changes.outputs.backend_changed == 'true'
+        with:
+          node-version: 22
+      - name: Cache node_modules
+        if: steps.changes.outputs.backend_changed == 'true'
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+      - name: Install dependencies
+        if: steps.changes.outputs.backend_changed == 'true' && steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Run workerd tests
+        if: steps.changes.outputs.backend_changed == 'true'
+        run: npm run test:workerd
+      - name: Skip workerd tests when irrelevant
+        if: steps.changes.outputs.backend_changed != 'true'
+        run: echo "No backend-relevant changes detected; workerd tests skipped."

@@ -1,0 +1,31 @@
+name: Deploy Frontend (QA)
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy to QA frontend
+        required: true
+        default: main
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: deploy-ui-qa
+  cancel-in-progress: true
+jobs:
+  deploy:
+    name: Deploy QA Frontend
+    uses: ./.github/workflows/deploy-ui-core.yml
+    with:
+      ref: ${{ inputs.ref }}
+      environment: qa
+      notify_slack: ${{ inputs.notify_slack }}
+    secrets:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

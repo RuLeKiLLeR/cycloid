@@ -1,0 +1,18 @@
+{
+  "codexCliVersion": "0.129.0",
+  "itemTypes": ["agentMessage", "fileChange", "reasoning", "userMessage"],
+  "notifications": [
+    "account/rateLimits/updated",
+    "error",
+    "item/agentMessage/delta",
+    "item/completed",
+    "item/started",
+    "thread/started",
+    "thread/tokenUsage/updated",
+    "turn/completed",
+    "turn/diff/updated",
+    "turn/started",
+    "warning"
+  ],
+  "serverRequests": []
+}

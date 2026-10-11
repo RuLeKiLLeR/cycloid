@@ -1,0 +1,4 @@
+interface:
+  display_name: "Daily Update"
+  short_description: "Summarize today's work for Slack."
+  default_prompt: "Use $daily-update to draft a short coworker-facing Slack update from what I accomplished today."

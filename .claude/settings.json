@@ -1,0 +1,33 @@
+{
+  "enabledPlugins": {
+    "typescript-lsp@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cycloid sessions *)",
+      "Bash(cycloid watch *)",
+      "Bash(git fetch *)",
+      "Bash(open *)",
+      "mcp__datadog-mcp__analyze_datadog_logs",
+      "mcp__datadog-mcp__search_datadog_logs",
+      "mcp__datadog-mcp__search_datadog_monitors",
+      "mcp__datadog-mcp__search_datadog_events",
+      "mcp__datadog-mcp__get_datadog_trace",
+      "mcp__datadog-mcp__load_datadog_skill",
+      "mcp__datadog-mcp__list_datadog_skills"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "scripts/guard-remote-wrangler.sh --claude-pretool"
+          }
+        ]
+      }
+    ]
+  }
+}

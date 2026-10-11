@@ -1,0 +1,36 @@
+.git/
+.env
+node_modules/
+dist/
+**/dist/
+**/.wrangler/
+.data/
+evals/results/
+infra/.terraform/
+infra/**/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/terraform.tfvars
+infra/**/.terraform.lock.hcl
+infra/bootstrap/.terraform/
+infra/bootstrap/*.tfstate
+infra/bootstrap/*.tfstate.*
+apps/control-plane-worker/.dev.vars
+apps/control-plane-worker/.wrangler/
+.tunnel-url
+.worktree-ports
+.worktrees/
+.npm-cache/
+.claude/worktrees/
+.gstack/
+certs/
+research/
+tasks/
+.scratch/
+playwright-report/
+test-results/
+__pycache__/
+
+# Hand-authored design specs: intentional fence/identifier structure (e.g. the
+# ARC-1330 deployment-plan's nested copy-paste prompt boxes) that prettier mangles.
+docs/superpowers/specs/

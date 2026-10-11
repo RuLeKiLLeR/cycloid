@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Prod Docs"
+  short_description: "Audit docs.trycycloid.com against the current repo"
+  default_prompt: "Use $audit-prod-docs to audit the public production docs at docs.trycycloid.com against this repository, verify each tab's claims against the code, and report outdated items and improvements with evidence. If needed, include an alternate docs URL."

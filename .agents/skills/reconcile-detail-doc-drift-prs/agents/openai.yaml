@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reconcile Detail Doc Drift PRs"
+  short_description: "Sweep, merge, or close Detail doc drift PRs"
+  default_prompt: "Use $reconcile-detail-doc-drift-prs to process all open Detail doc drift PRs in this repo by merging the ones that are still current and closing the ones that are stale."

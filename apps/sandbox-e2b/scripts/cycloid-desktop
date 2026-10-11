@@ -1,0 +1,2904 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import hashlib
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+import fcntl
+from contextlib import contextmanager
+from pathlib import Path
+from subprocess import TimeoutExpired
+from typing import Any
+from urllib.parse import urlsplit
+
+STATE_DIR = Path(os.environ.get("ARCANIST_DESKTOP_STATE_DIR", "/tmp/cycloid-desktop"))
+HEALTH_PATH = Path(os.environ.get("ARCANIST_DESKTOP_HEALTH_PATH", str(STATE_DIR / "health.json")))
+LOG_PATH = Path(os.environ.get("ARCANIST_DESKTOP_CLI_LOG_PATH", str(STATE_DIR / "logs" / "desktop-cli.log")))
+ACTION_LOCK_PATH = Path(os.environ.get("ARCANIST_DESKTOP_ACTION_LOCK_PATH", str(STATE_DIR / "action.lock")))
+RECORDING_STATE_PATH = Path(os.environ.get("ARCANIST_DESKTOP_RECORDING_STATE_PATH", str(STATE_DIR / "recording.json")))
+EVIDENCE_ROOT = Path(os.environ.get("ARCANIST_DESKTOP_EVIDENCE_ROOT", "/tmp/phase-evidence/desktop"))
+RUNTIME_EVIDENCE_ROOT = Path(os.environ.get("ARCANIST_RUNTIME_EVIDENCE_DIR", "/tmp/cycloid-evidence"))
+DISPLAY_VALUE = os.environ.get("DISPLAY") or os.environ.get("ARCANIST_DESKTOP_DISPLAY") or ":99"
+SCREENSHOT_TIMEOUT_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_SCREENSHOT_TIMEOUT_SECONDS", "5"))
+READ_TIMEOUT_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_READ_TIMEOUT_SECONDS", "5"))
+ACTION_LOCK_TIMEOUT_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_ACTION_LOCK_TIMEOUT_SECONDS", "10"))
+MAX_SCREENSHOTS_PER_SESSION = int(os.environ.get("ARCANIST_DESKTOP_MAX_SCREENSHOTS_PER_SESSION", "500"))
+MAX_RAW_BYTES_PER_SESSION = int(os.environ.get("ARCANIST_DESKTOP_MAX_RAW_BYTES_PER_SESSION", str(256 * 1024 * 1024)))
+MODEL_IMAGE_MAX_BYTES = 2.5 * 1024 * 1024
+MAX_SCREENSHOT_BYTES = min(
+    int(os.environ.get("ARCANIST_DESKTOP_MAX_SCREENSHOT_BYTES", str(int(MODEL_IMAGE_MAX_BYTES)))),
+    int(MODEL_IMAGE_MAX_BYTES),
+)
+OPEN_APP_STARTUP_CONFIRMATION_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_OPEN_APP_STARTUP_CONFIRMATION_SECONDS", "1"))
+RECORDING_MAX_DURATION_MS = int(os.environ.get("ARCANIST_DESKTOP_RECORDING_MAX_DURATION_MS", "60000"))
+RECORDING_MAX_BYTES = int(os.environ.get("ARCANIST_DESKTOP_RECORDING_MAX_BYTES", str(50 * 1024 * 1024)))
+RECORDING_FPS = int(os.environ.get("ARCANIST_DESKTOP_RECORDING_FPS", "10"))
+RECORDING_STOP_GRACE_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_RECORDING_STOP_GRACE_SECONDS", "5"))
+RECORDING_OVERLAY_TIMEOUT_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_RECORDING_OVERLAY_TIMEOUT_SECONDS", "30"))
+DESKTOP_READY_WAIT_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_READY_WAIT_SECONDS", "8"))
+DESKTOP_READY_POLL_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_READY_POLL_SECONDS", "0.2"))
+DESKTOP_SUPERVISOR_START_TIMEOUT_SECONDS = float(
+    os.environ.get("ARCANIST_DESKTOP_SUPERVISOR_START_TIMEOUT_SECONDS", "5")
+)
+OPEN_APP_FOCUS_WAIT_SECONDS = float(os.environ.get("ARCANIST_DESKTOP_OPEN_APP_FOCUS_WAIT_SECONDS", "5"))
+DESKTOP_PROTOCOL_VERSION = "2"
+CURRENT_BRIDGE_BUNDLE_SHA256: str | None = None
+SUPERVISOR_GENERATION_PATH = STATE_DIR / "supervisor-generation"
+
+CHROMIUM_COMMAND_NAMES = {"chromium", "chromium-browser", "google-chrome", "google-chrome-stable"}
+
+SCENARIO_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+WINDOW_ID_PATTERN = re.compile(r"^0x[0-9A-Fa-f]+$")
+HOTKEY_PATTERN = re.compile(r"^[A-Za-z0-9_+:.\/-]+$")
+MUTATING_COMMANDS = {"click", "type", "hotkey", "scroll", "drag", "open_app", "focus_window"}
+RECORDING_COMMANDS = {"record_start", "record_stop", "record_status", "record_select_evidence"}
+MULTI_VALUE_OPTIONS = {"proof-screenshot"}
+SCREENSHOT_EXTENSIONS = {".webp", ".png", ".jpg", ".jpeg"}
+WEBP_MIME_TYPE = "image/webp"
+
+
+class ScreenshotCaptureError(RuntimeError):
+    """A screenshot could not be captured, validated, or encoded safely."""
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def empty_result(action: str, action_id: str, started_at_ms: int) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "actionId": action_id,
+        "action": action,
+        "startedAtMs": started_at_ms,
+        "completedAtMs": started_at_ms,
+        "display": {"width": 0, "height": 0, "scale": 1},
+        "activeWindow": {"id": None, "title": None, "process": None, "bounds": None},
+        "pointer": None,
+        "screenshot": None,
+        "recentScreenshots": [],
+        "warning": None,
+        "error": None,
+        "typedCharacterCount": None,
+        "inputRedacted": False,
+        "desktopReadiness": {
+            "lazyStartRequested": False,
+            "waitMs": 0,
+            "outcome": "not_checked",
+            "healthCheckMode": None,
+        },
+        "timings": {
+            "readinessMs": 0,
+            "queueMs": 0,
+            "commandMs": 0,
+            "metadataMs": 0,
+            "screenshotCaptureMs": 0,
+            "screenshotEncodeMs": 0,
+        },
+        "desktopProtocol": desktop_protocol_identity(None),
+        "desktopRuntime": browser_runtime_identity(),
+    }
+
+
+def hash_file(path: Path | None) -> str:
+    if path is None:
+        return "unknown"
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return "unknown"
+
+
+def desktop_protocol_identity(bridge_bundle_sha256: str | None) -> dict[str, str]:
+    supervisor = shutil.which("cycloid-desktop-supervisor")
+    return {
+        "version": DESKTOP_PROTOCOL_VERSION,
+        "cliSha256": hash_file(Path(__file__).resolve()),
+        "supervisorSha256": hash_file(Path(supervisor).resolve()) if supervisor else "unknown",
+        "bridgeBundleSha256": bridge_bundle_sha256 or CURRENT_BRIDGE_BUNDLE_SHA256 or "unknown",
+    }
+
+
+def browser_runtime_identity() -> dict[str, Any]:
+    configured = os.environ.get("ARCANIST_DESKTOP_BROWSER_EXECUTABLE") or os.environ.get(
+        "AGENT_BROWSER_EXECUTABLE_PATH"
+    )
+    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    candidate: str | None = None
+    source = "configured" if configured else "path"
+    if configured:
+        candidate = shutil.which(configured)
+        if candidate is None:
+            configured_path = Path(configured)
+            if configured_path.is_file() and os.access(configured_path, os.X_OK):
+                candidate = str(configured_path)
+    else:
+        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+            candidate = shutil.which(name)
+            if candidate:
+                break
+
+    resolved: str | None = None
+    if candidate:
+        try:
+            resolved_path = Path(candidate).resolve(strict=True)
+            if resolved_path.is_file() and os.access(resolved_path, os.X_OK):
+                resolved = str(resolved_path)
+        except OSError:
+            resolved = None
+
+    protected = True
+    if resolved and browsers_root:
+        try:
+            resolved_path = Path(resolved)
+            root_path = Path(browsers_root).resolve(strict=True)
+            resolved_path.relative_to(root_path)
+        except (OSError, ValueError):
+            protected = False
+    status = "ready" if resolved and protected else "missing"
+    generation = None
+    try:
+        generation = SUPERVISOR_GENERATION_PATH.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    return {
+        "browserStatus": status,
+        "browserSource": source,
+        "browserConfiguredPath": configured,
+        "browserResolvedPath": resolved,
+        "browserSymlink": bool(configured and Path(configured).is_symlink()),
+        "browserPlatformProtected": protected if resolved else False,
+        "supervisorGeneration": generation,
+    }
+
+
+def structured_error(
+    code: str,
+    message: str,
+    *,
+    retryable: bool,
+    safe_to_retry: bool,
+    recommended_next_tool: str | None,
+    expected_window_id: str | None = None,
+    actual_window_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "safeToRetry": safe_to_retry,
+        "recommendedNextTool": recommended_next_tool,
+        "expectedWindowId": expected_window_id,
+        "actualWindowId": actual_window_id,
+    }
+
+
+def finish(result: dict[str, Any]) -> dict[str, Any]:
+    result["completedAtMs"] = now_ms()
+    return result
+
+
+def set_desktop_readiness(result: dict[str, Any], readiness: dict[str, Any]) -> None:
+    result["desktopReadiness"] = readiness
+    wait_ms = readiness.get("waitMs")
+    result["timings"]["readinessMs"] = wait_ms if isinstance(wait_ms, int) and wait_ms >= 0 else 0
+
+
+def record_stage_timing(result: dict[str, Any], stage: str, started_at_ms: int) -> None:
+    result["timings"][stage] = max(0, now_ms() - started_at_ms)
+
+
+def emit_json(result: dict[str, Any], exit_code: int) -> int:
+    print(json.dumps(result, separators=(",", ":")))
+    return exit_code
+
+
+def log_event(event: str, fields: dict[str, Any]) -> None:
+    pieces = [f"event={event}"]
+    for key, value in fields.items():
+        if value is None:
+            continue
+        sanitized = str(value).replace("\n", "_").replace("\r", "_")
+        pieces.append(f"{key}={sanitized}")
+    line = " ".join(pieces)
+    print(line, file=sys.stderr)
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def parse_args(argv: list[str]) -> tuple[str | None, dict[str, Any], str | None]:
+    if not argv:
+        return None, {}, "missing command"
+    command = argv[0]
+    options: dict[str, Any] = {"json": False}
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--json":
+            options["json"] = True
+            index += 1
+            continue
+        if arg in {
+            "--scenario-id",
+            "--action-id",
+            "--purpose",
+            "--x",
+            "--y",
+            "--button",
+            "--text",
+            "--keys",
+            "--amount",
+            "--from-x",
+            "--from-y",
+            "--to-x",
+            "--to-y",
+            "--command",
+            "--url",
+            "--window-id",
+            "--title",
+            "--timeout-ms",
+            "--label",
+            "--recording-id",
+            "--acknowledge-no-secrets",
+            "--reason",
+            "--desktop-protocol-version",
+            "--bridge-bundle-sha256",
+            "--target-window-id",
+        }:
+            if index + 1 >= len(argv):
+                return command, options, f"{arg} requires a value"
+            key = arg[2:]
+            options[key] = argv[index + 1]
+            index += 2
+            continue
+        if arg == "--resume-check":
+            options["resume-check"] = True
+            index += 1
+            continue
+        return command, options, f"unknown argument: {arg}"
+    if options["json"] is not True:
+        return command, options, "--json is required"
+    return command, options, None
+
+
+def read_health() -> dict[str, Any] | None:
+    try:
+        return json.loads(HEALTH_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def start_supervisor_if_available() -> bool:
+    supervisor = shutil.which("cycloid-desktop-supervisor")
+    if supervisor is None:
+        return False
+    try:
+        result = subprocess.run(
+            [supervisor, "start"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=max(0.1, DESKTOP_SUPERVISOR_START_TIMEOUT_SECONDS),
+        )
+    except (OSError, TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def refresh_supervisor_health_if_available() -> dict[str, Any] | None:
+    supervisor = shutil.which("cycloid-desktop-supervisor")
+    if supervisor is None:
+        return None
+    try:
+        result = subprocess.run(
+            [supervisor, "health"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=max(0.1, DESKTOP_SUPERVISOR_START_TIMEOUT_SECONDS),
+        )
+    except (OSError, TimeoutExpired):
+        log_event("desktop.health_refresh", {"outcome": "failed"})
+        return None
+    if result.returncode != 0:
+        log_event("desktop.health_refresh", {"outcome": "failed", "exit_code": result.returncode})
+        return None
+    try:
+        health = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log_event("desktop.health_refresh", {"outcome": "invalid_json"})
+        return None
+    if not isinstance(health, dict):
+        log_event("desktop.health_refresh", {"outcome": "invalid_json"})
+        return None
+    log_event("desktop.health_refresh", {"outcome": "completed", "status": health.get("status")})
+    return health
+
+
+def desktop_readiness(
+    health: dict[str, Any] | None,
+    *,
+    lazy_start_requested: bool,
+    wait_started_at: float,
+    outcome: str,
+) -> dict[str, Any]:
+    health_check_mode = health.get("healthCheckMode") if isinstance(health, dict) else None
+    return {
+        "lazyStartRequested": lazy_start_requested,
+        "waitMs": max(0, round((time.monotonic() - wait_started_at) * 1000)),
+        "outcome": outcome,
+        "healthCheckMode": health_check_mode if isinstance(health_check_mode, str) else None,
+    }
+
+
+def ensure_desktop_available() -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    wait_started_at = time.monotonic()
+    health = read_health()
+    if desktop_is_available(health):
+        return health, desktop_readiness(
+            health,
+            lazy_start_requested=False,
+            wait_started_at=wait_started_at,
+            outcome="already_available",
+        )
+    if DESKTOP_READY_WAIT_SECONDS <= 0:
+        return health, desktop_readiness(
+            health,
+            lazy_start_requested=False,
+            wait_started_at=wait_started_at,
+            outcome="wait_disabled",
+        )
+
+    supervisor_started = start_supervisor_if_available()
+    log_event(
+        "desktop.ensure",
+        {
+            "outcome": "supervisor_start_requested" if supervisor_started else "supervisor_unavailable",
+            "wait_s": DESKTOP_READY_WAIT_SECONDS,
+        },
+    )
+    deadline = time.monotonic() + DESKTOP_READY_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        health = read_health()
+        if desktop_is_available(health):
+            log_event("desktop.ensure", {"outcome": "available"})
+            return health, desktop_readiness(
+                health,
+                lazy_start_requested=supervisor_started,
+                wait_started_at=wait_started_at,
+                outcome="ready_after_lazy_start" if supervisor_started else "ready_while_waiting",
+            )
+        time.sleep(max(0.05, DESKTOP_READY_POLL_SECONDS))
+    health = read_health() or health
+    return health, desktop_readiness(
+        health,
+        lazy_start_requested=supervisor_started,
+        wait_started_at=wait_started_at,
+        outcome="unavailable_after_wait" if supervisor_started else "supervisor_unavailable",
+    )
+
+
+def display_from_health(health: dict[str, Any] | None) -> dict[str, Any]:
+    size = health.get("size") if isinstance(health, dict) else None
+    if isinstance(size, dict):
+        width = int(size.get("width") or 0)
+        height = int(size.get("height") or 0)
+    else:
+        width = 0
+        height = 0
+    return {"width": width, "height": height, "scale": 1}
+
+
+def desktop_is_available(health: dict[str, Any] | None) -> bool:
+    return bool(isinstance(health, dict) and health.get("ok") is True and health.get("status") == "available")
+
+
+def unavailable_error(health: dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(health, dict):
+        component = health.get("failedComponent")
+        last_error = health.get("lastError") or health.get("status") or "desktop unavailable"
+        if component:
+            message = f"Desktop unavailable: {component} ({last_error})"
+        else:
+            message = f"Desktop unavailable: {last_error}"
+    else:
+        message = "Desktop health is unavailable."
+    return {"code": "desktop_unavailable", "message": message, "retryable": True}
+
+
+def run_command(args: list[str], timeout_seconds: float) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["DISPLAY"] = DISPLAY_VALUE
+    return subprocess.run(
+        args,
+        env=env,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout_seconds,
+    )
+
+
+@contextmanager
+def desktop_action_lock():
+    ACTION_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ACTION_LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + ACTION_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("desktop action lock is busy")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def command_timeout_seconds(action: str) -> float:
+    env_key = f"CYCLOID_DESKTOP_{action.upper()}_TIMEOUT_SECONDS"
+    if env_key in os.environ:
+        return float(os.environ[env_key])
+    if action == "type":
+        return 15.0
+    return 8.0
+
+
+def action_timeout_seconds(action: str, options: dict[str, Any]) -> tuple[float | None, str | None]:
+    raw = options.get("timeout-ms")
+    if raw is None:
+        return command_timeout_seconds(action), None
+    if not isinstance(raw, str) or raw == "":
+        return None, "--timeout-ms must be an integer"
+    try:
+        timeout_ms = int(raw)
+    except ValueError:
+        return None, "--timeout-ms must be an integer"
+    if timeout_ms <= 0:
+        return None, "--timeout-ms must be greater than 0"
+    return timeout_ms / 1000, None
+
+
+def parse_int_option(
+    options: dict[str, Any],
+    name: str,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> tuple[int | None, str | None]:
+    raw = options.get(name)
+    if not isinstance(raw, str) or raw == "":
+        return None, f"--{name} is required"
+    try:
+        value = int(raw)
+    except ValueError:
+        return None, f"--{name} must be an integer"
+    if minimum is not None and value < minimum:
+        return None, f"--{name} must be at least {minimum}"
+    if maximum is not None and value > maximum:
+        return None, f"--{name} must be at most {maximum}"
+    return value, None
+
+
+def require_non_empty_option(options: dict[str, Any], name: str) -> tuple[str | None, str | None]:
+    raw = options.get(name)
+    if not isinstance(raw, str) or raw == "":
+        return None, f"--{name} is required"
+    return raw, None
+
+
+def validate_coordinate(value: int, axis: str, display: dict[str, Any]) -> str | None:
+    limit = int(display.get("width" if axis == "x" else "height") or 0)
+    if limit <= 0:
+        return "display size is unavailable"
+    if value < 0 or value >= limit:
+        return f"{axis} coordinate {value} is outside display bounds"
+    return None
+
+
+def validate_point(x: int, y: int, display: dict[str, Any]) -> str | None:
+    return validate_coordinate(x, "x", display) or validate_coordinate(y, "y", display)
+
+
+def command_name(args: list[str]) -> str:
+    return Path(args[0]).name if args else ""
+
+
+def chromium_flag_name(arg: str) -> str:
+    return arg.split("=", 1)[0]
+
+
+def has_chromium_flag(args: list[str], flag: str) -> bool:
+    return any(chromium_flag_name(arg) == flag for arg in args[1:])
+
+
+def is_chromium_command(args: list[str]) -> bool:
+    return command_name(args) in CHROMIUM_COMMAND_NAMES
+
+
+def browser_window_size(display: dict[str, Any]) -> tuple[int, int]:
+    width = int(display.get("width") or 1280)
+    height = int(display.get("height") or 720)
+    return max(width, 800), max(height, 600)
+
+
+def merge_json_dict(target: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            merge_json_dict(target[key], value)
+        else:
+            target[key] = value
+    return target
+
+
+def write_chromium_json(path: Path, updates: dict[str, Any]) -> None:
+    current: dict[str, Any] = {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            current = parsed
+    except (OSError, json.JSONDecodeError):
+        current = {}
+    merge_json_dict(current, updates)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(current, separators=(",", ":")), encoding="utf-8")
+
+
+def prepare_chromium_profile(profile_dir: Path) -> None:
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "First Run").touch(exist_ok=True)
+        write_chromium_json(
+            profile_dir / "Local State",
+            {
+                "browser": {"check_default_browser": False},
+                "profile": {"last_used": "Default"},
+                "signin": {"allowed": False},
+            },
+        )
+        write_chromium_json(
+            profile_dir / "Default" / "Preferences",
+            {
+                "browser": {"check_default_browser": False},
+                "credentials_enable_service": False,
+                "distribution": {
+                    "make_chrome_default": False,
+                    "make_chrome_default_for_user": False,
+                    "skip_first_run_ui": True,
+                },
+                "profile": {
+                    "default_content_setting_values": {"notifications": 2},
+                    "password_manager_enabled": False,
+                },
+                "sync_promo": {"show_on_first_run_allowed": False},
+            },
+        )
+    except OSError:
+        pass
+
+
+def normalize_open_app_args(args: list[str], display: dict[str, Any]) -> list[str]:
+    if not is_chromium_command(args):
+        return args
+
+    width, height = browser_window_size(display)
+    profile_dir = STATE_DIR / "chromium-profile"
+    prepare_chromium_profile(profile_dir)
+
+    defaults = [
+        "--new-window",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-signin-promo",
+        "--disable-sync",
+        "--disable-features=SigninIntercept,SyncPromoAfterSigninIntercept,ChromeWhatsNewUI,SignInProfileCreation",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--start-maximized",
+        "--window-position=0,0",
+        f"--window-size={width},{height}",
+        "--force-device-scale-factor=1",
+    ]
+    if not has_chromium_flag(args, "--user-data-dir") and not has_chromium_flag(args, "--guest"):
+        defaults.append(f"--user-data-dir={profile_dir}")
+
+    additions = [flag for flag in defaults if not has_chromium_flag(args, chromium_flag_name(flag))]
+    return [args[0], *additions, *args[1:]]
+
+
+def run_action_command(action: str, args: list[str], timeout_seconds: float) -> tuple[bool, str | None, str | None, int | None]:
+    started = now_ms()
+    try:
+        result = run_command(args, timeout_seconds)
+    except TimeoutExpired:
+        return False, "action_timeout", f"{action} timed out", now_ms() - started
+    except OSError:
+        return False, "action_failed", f"{action} could not start", now_ms() - started
+    if result.returncode != 0:
+        return False, "action_failed", f"{action} exited with code {result.returncode}", now_ms() - started
+    return True, None, None, now_ms() - started
+
+
+def run_open_app_command(args: list[str], timeout_seconds: float) -> tuple[bool, str | None, str | None, int | None]:
+    started = now_ms()
+    env = os.environ.copy()
+    env["DISPLAY"] = DISPLAY_VALUE
+    previous_window_ids = {window["id"] for window in query_windows()}
+    browser_like = is_chromium_command(args)
+    try:
+        process = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return False, "action_failed", "open_app could not start", now_ms() - started
+
+    confirmation_timeout = min(timeout_seconds, OPEN_APP_STARTUP_CONFIRMATION_SECONDS)
+    deadline = time.monotonic() + confirmation_timeout
+    while True:
+        returncode = process.poll()
+        if returncode is not None:
+            if returncode != 0:
+                return False, "action_failed", f"open_app exited with code {returncode}", now_ms() - started
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.01, remaining))
+
+    remaining_timeout_seconds = max(0.0, timeout_seconds - ((now_ms() - started) / 1000))
+    opened_window = wait_for_opened_window(
+        previous_window_ids,
+        process,
+        browser_like,
+        min(OPEN_APP_FOCUS_WAIT_SECONDS, remaining_timeout_seconds),
+    )
+    if focus_opened_window(opened_window):
+        return True, None, None, now_ms() - started
+    return False, "focus_not_proven", "open_app launched but active window focus could not be proven", now_ms() - started
+
+
+def build_mutating_action_args(
+    action: str,
+    options: dict[str, Any],
+    display: dict[str, Any],
+) -> tuple[list[str] | None, dict[str, Any], str | None]:
+    metadata: dict[str, Any] = {
+        "typedCharacterCount": None,
+        "inputRedacted": False,
+        "validationErrorCode": None,
+        "expectedWindowId": None,
+    }
+    if action == "click":
+        x, error = parse_int_option(options, "x")
+        if error:
+            return None, metadata, error
+        y, error = parse_int_option(options, "y")
+        if error:
+            return None, metadata, error
+        bounds_error = validate_point(x, y, display)
+        if bounds_error:
+            return None, metadata, bounds_error
+        button, error = parse_int_option(options, "button", 1, 5) if "button" in options else (1, None)
+        if error:
+            return None, metadata, error
+        return ["xdotool", "mousemove", str(x), str(y), "click", str(button)], metadata, None
+
+    if action == "type":
+        text, error = require_non_empty_option(options, "text")
+        if error:
+            return None, metadata, error
+        metadata["typedCharacterCount"] = len(text)
+        metadata["inputRedacted"] = True
+        return ["xdotool", "type", "--delay", "0", "--", text], metadata, None
+
+    if action == "hotkey":
+        keys, error = require_non_empty_option(options, "keys")
+        if error:
+            return None, metadata, error
+        if HOTKEY_PATTERN.match(keys) is None:
+            return None, metadata, "--keys contains unsupported characters"
+        return ["xdotool", "key", "--clearmodifiers", keys], metadata, None
+
+    if action == "scroll":
+        x, error = parse_int_option(options, "x")
+        if error:
+            return None, metadata, error
+        y, error = parse_int_option(options, "y")
+        if error:
+            return None, metadata, error
+        amount, error = parse_int_option(options, "amount", -20, 20)
+        if error:
+            return None, metadata, error
+        if amount == 0:
+            return None, metadata, "--amount must be non-zero"
+        bounds_error = validate_point(x, y, display)
+        if bounds_error:
+            return None, metadata, bounds_error
+        button = "5" if amount > 0 else "4"
+        args = ["xdotool", "mousemove", str(x), str(y)]
+        for _ in range(abs(amount)):
+            args.extend(["click", button])
+        return args, metadata, None
+
+    if action == "drag":
+        from_x, error = parse_int_option(options, "from-x")
+        if error:
+            return None, metadata, error
+        from_y, error = parse_int_option(options, "from-y")
+        if error:
+            return None, metadata, error
+        to_x, error = parse_int_option(options, "to-x")
+        if error:
+            return None, metadata, error
+        to_y, error = parse_int_option(options, "to-y")
+        if error:
+            return None, metadata, error
+        bounds_error = validate_point(from_x, from_y, display) or validate_point(to_x, to_y, display)
+        if bounds_error:
+            return None, metadata, bounds_error
+        return [
+            "xdotool",
+            "mousemove",
+            str(from_x),
+            str(from_y),
+            "mousedown",
+            "1",
+            "mousemove",
+            str(to_x),
+            str(to_y),
+            "mouseup",
+            "1",
+        ], metadata, None
+
+    if action == "focus_window":
+        window_id = options.get("window-id")
+        title = options.get("title")
+        if isinstance(window_id, str) and window_id:
+            if WINDOW_ID_PATTERN.match(window_id) is None:
+                return None, metadata, "--window-id must be a hexadecimal X11 window id"
+            metadata["expectedWindowId"] = window_id
+            return ["wmctrl", "-i", "-a", window_id], metadata, None
+        if isinstance(title, str) and title:
+            matches = [window for window in query_windows() if title.casefold() in str(window.get("title") or "").casefold()]
+            if not matches:
+                metadata["validationErrorCode"] = "focus_not_proven"
+                return None, metadata, f"no visible desktop window matched title: {title}"
+            target = matches[-1]
+            metadata["expectedWindowId"] = target["id"]
+            return ["wmctrl", "-i", "-a", target["id"]], metadata, None
+        return None, metadata, "--window-id or --title is required"
+
+    if action == "open_app":
+        command = options.get("command")
+        url = options.get("url")
+        if isinstance(command, str) and command and isinstance(url, str) and url:
+            return None, metadata, "--command and --url are mutually exclusive"
+        if isinstance(url, str) and url:
+            validated_url = validated_http_url(url)
+            if validated_url is None:
+                return None, metadata, "--url must be an http or https URL without embedded credentials"
+            browser = chromium_executable()
+            if browser is None:
+                metadata["validationErrorCode"] = "browser_missing"
+                return None, metadata, "no supported Chromium browser executable is available"
+            return normalize_open_app_args([browser, validated_url], display), metadata, None
+        if not isinstance(command, str) or not command:
+            return None, metadata, "--url or --command is required"
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            return None, metadata, "--command could not be parsed"
+        if not args:
+            return None, metadata, "--url or --command is required"
+        if len(args) == 1:
+            validated_url = validated_http_url(args[0])
+            if validated_url is not None:
+                browser = chromium_executable()
+                if browser is None:
+                    metadata["validationErrorCode"] = "browser_missing"
+                    return None, metadata, "no supported Chromium browser executable is available"
+                args = [browser, validated_url]
+        return normalize_open_app_args(args, display), metadata, None
+
+    return None, metadata, f"unknown command: {action}"
+
+
+def wait_for_opened_window(
+    previous_window_ids: set[str],
+    process: Any,
+    browser_like: bool,
+    timeout_seconds: float = OPEN_APP_FOCUS_WAIT_SECONDS,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    last_windows: list[dict[str, Any]] = []
+    while time.monotonic() <= deadline:
+        windows = query_windows()
+        if windows:
+            last_windows = windows
+            new_windows = [window for window in windows if window["id"] not in previous_window_ids]
+            if new_windows:
+                return new_windows[-1]
+        if not browser_like and process.poll() is not None:
+            break
+        if timeout_seconds <= 0:
+            break
+        time.sleep(0.1)
+    if last_windows:
+        return last_windows[-1]
+    return None
+
+
+def focus_opened_window(window: dict[str, Any] | None) -> bool:
+    if window is None or shutil.which("wmctrl") is None:
+        return False
+    window_id = window.get("id")
+    if not isinstance(window_id, str) or WINDOW_ID_PATTERN.match(window_id) is None:
+        return False
+
+    maximized = run_action_command(
+        "open_app_focus",
+        ["wmctrl", "-i", "-r", window_id, "-b", "add,maximized_vert,maximized_horz"],
+        READ_TIMEOUT_SECONDS,
+    )[0]
+    focused = run_action_command("open_app_focus", ["wmctrl", "-i", "-a", window_id], READ_TIMEOUT_SECONDS)[0]
+    focus_verified = wait_for_active_window(window_id) if focused else False
+    log_event(
+        "desktop.open_app_focus",
+        {"window_id": window_id, "focused": focused, "focus_verified": focus_verified, "maximized": maximized},
+    )
+    return focused and focus_verified
+
+
+def parse_window_id(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value, 16 if value.lower().startswith("0x") else 10)
+    except ValueError:
+        return None
+
+
+def active_window_id() -> str | None:
+    if shutil.which("xdotool") is None:
+        return None
+    try:
+        result = run_command(["xdotool", "getactivewindow"], READ_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    active = result.stdout.strip()
+    return active or None
+
+
+def wait_for_active_window(expected_window_id: str, timeout_seconds: float = OPEN_APP_FOCUS_WAIT_SECONDS) -> bool:
+    expected = parse_window_id(expected_window_id)
+    if expected is None:
+        return False
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    while time.monotonic() < deadline:
+        if parse_window_id(active_window_id()) == expected:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def focus_window_with_postcondition(
+    args: list[str],
+    expected_window_id: str,
+    timeout_seconds: float,
+) -> tuple[bool, str | None, str | None, int | None, str | None]:
+    started = now_ms()
+    for attempt in range(2):
+        focused, error_code, error_message, _duration_ms = run_action_command("focus_window", args, timeout_seconds)
+        if not focused:
+            return False, error_code, error_message, now_ms() - started, active_window_id()
+        if wait_for_active_window(expected_window_id, min(0.75, timeout_seconds)):
+            log_event(
+                "desktop.focus_postcondition",
+                {"outcome": "verified", "expected_window_id": expected_window_id, "attempt": attempt + 1},
+            )
+            return True, None, None, now_ms() - started, active_window_id()
+        log_event(
+            "desktop.focus_postcondition",
+            {
+                "outcome": "not_proven",
+                "expected_window_id": expected_window_id,
+                "actual_window_id": active_window_id(),
+                "attempt": attempt + 1,
+            },
+        )
+    actual = active_window_id()
+    return (
+        False,
+        "focus_not_proven",
+        f"focus_window did not activate expected window {expected_window_id}; active window is {actual or 'unknown'}",
+        now_ms() - started,
+        actual,
+    )
+
+
+def focus_target_window_before_action(target_window_id: str, timeout_seconds: float) -> tuple[bool, str | None]:
+    focused, _error_code, _error_message, _duration_ms, actual_window_id = focus_window_with_postcondition(
+        ["wmctrl", "-i", "-a", target_window_id],
+        target_window_id,
+        timeout_seconds,
+    )
+    return focused, actual_window_id
+
+
+def capture_action_feedback(
+    result: dict[str, Any],
+    action_id: str,
+    scenario_id: str,
+    action_failed: bool,
+) -> None:
+    capture_started_at = now_ms()
+    quota_ok, quota_message = quota_allows_capture()
+    if not quota_ok:
+        result["warning"] = {"code": "screenshot_quota_exceeded", "message": quota_message}
+        log_event("desktop.action_screenshot", {"action": action_id, "outcome": "quota_exceeded"})
+        record_stage_timing(result, "screenshotCaptureMs", capture_started_at)
+        return
+    try:
+        screenshot = capture_screenshot(action_id, scenario_id, "action_feedback")
+    except ValueError as err:
+        result["ok"] = False
+        result["error"] = structured_error(
+            "path_containment_failed",
+            str(err),
+            retryable=False,
+            safe_to_retry=False,
+            recommended_next_tool=f"desktop.{result['action']}",
+        )
+        log_event("desktop.action_screenshot", {"action": action_id, "outcome": "path_containment_failed"})
+        record_stage_timing(result, "screenshotCaptureMs", capture_started_at)
+        return
+    except (ScreenshotCaptureError, RuntimeError, TimeoutError) as err:
+        result["ok"] = False
+        result["error"] = structured_error(
+            "screenshot_capture_failed",
+            str(err),
+            retryable=True,
+            safe_to_retry=True,
+            recommended_next_tool="desktop.screenshot",
+        )
+        log_event("desktop.action_screenshot", {"action": action_id, "outcome": "screenshot_capture_failed"})
+        record_stage_timing(result, "screenshotCaptureMs", capture_started_at)
+        return
+    record_screenshot_timings(result, screenshot, capture_started_at)
+    result["screenshot"] = screenshot
+    result["recentScreenshots"] = recent_screenshots(scenario_id, screenshot["path"])
+    result["display"] = {
+        "width": screenshot["width"] or result["display"]["width"],
+        "height": screenshot["height"] or result["display"]["height"],
+        "scale": 1,
+    }
+    record_stage_timing(result, "screenshotCaptureMs", capture_started_at)
+
+
+def run_mutating_command(
+    action: str,
+    action_id: str,
+    started_at_ms: int,
+    options: dict[str, Any],
+    scenario_id: str,
+) -> tuple[dict[str, Any], int]:
+    health, readiness = ensure_desktop_available()
+    result = empty_result(action, action_id, started_at_ms)
+    set_desktop_readiness(result, readiness)
+    result["display"] = display_from_health(health)
+    if not desktop_is_available(health):
+        result["error"] = unavailable_error(health)
+        log_event("desktop.action", {"action": action, "action_id": action_id, "outcome": "desktop_unavailable"})
+        return finish(result), 1
+    if action in {"click", "type", "hotkey", "scroll", "drag"} and shutil.which("xdotool") is None:
+        result["error"] = {"code": "desktop_unavailable", "message": "xdotool is not available", "retryable": True}
+        log_event(
+            "desktop.action",
+            {"action": action, "action_id": action_id, "outcome": "desktop_unavailable", "dependency": "xdotool"},
+        )
+        return finish(result), 1
+    target_window_id = options.get("target-window-id")
+    if isinstance(target_window_id, str) and target_window_id and WINDOW_ID_PATTERN.match(target_window_id) is None:
+        result["error"] = structured_error(
+            "invalid_request",
+            "--target-window-id must be a hexadecimal X11 window id",
+            retryable=False,
+            safe_to_retry=False,
+            recommended_next_tool="desktop.windows",
+        )
+        return finish(result), 2
+    if (action == "focus_window" or target_window_id) and shutil.which("wmctrl") is None:
+        result["error"] = {"code": "desktop_unavailable", "message": "wmctrl is not available", "retryable": True}
+        log_event(
+            "desktop.action",
+            {"action": action, "action_id": action_id, "outcome": "desktop_unavailable", "dependency": "wmctrl"},
+        )
+        return finish(result), 1
+
+    action_args, metadata, validation_error = build_mutating_action_args(action, options, result["display"])
+    result["typedCharacterCount"] = metadata["typedCharacterCount"]
+    result["inputRedacted"] = metadata["inputRedacted"]
+    if validation_error is not None or action_args is None:
+        validation_error_code = metadata.get("validationErrorCode")
+        if validation_error_code == "browser_missing":
+            result["error"] = structured_error(
+                "browser_missing",
+                validation_error or "no supported Chromium browser executable is available",
+                retryable=True,
+                safe_to_retry=True,
+                recommended_next_tool=None,
+            )
+        elif validation_error_code == "focus_not_proven":
+            result["error"] = structured_error(
+                "focus_not_proven",
+                validation_error or "desktop window focus could not be proven",
+                retryable=True,
+                safe_to_retry=True,
+                recommended_next_tool="desktop.windows",
+                expected_window_id=metadata.get("expectedWindowId"),
+                actual_window_id=active_window_id(),
+            )
+        else:
+            result["error"] = {"code": "invalid_request", "message": validation_error or "invalid action", "retryable": False}
+        # Validation/precondition failures must be cheap and actionable. A
+        # full screenshot here used to add seconds (or hang on a dead VNC)
+        # before the agent could retry with desktop.windows/focus_window.
+        outcome = str(result["error"]["code"])
+        log_event("desktop.action", {"action": action, "action_id": action_id, "outcome": outcome})
+        return finish(result), 2 if outcome == "invalid_request" else 1
+    timeout_seconds, timeout_error = action_timeout_seconds(action, options)
+    if timeout_error is not None or timeout_seconds is None:
+        result["error"] = {"code": "invalid_request", "message": timeout_error or "invalid timeout", "retryable": False}
+        log_event("desktop.action", {"action": action, "action_id": action_id, "outcome": "invalid_request"})
+        return finish(result), 2
+
+    queue_started_at = now_ms()
+    try:
+        with desktop_action_lock():
+            record_stage_timing(result, "queueMs", queue_started_at)
+            action_started = now_ms()
+            if isinstance(target_window_id, str) and target_window_id:
+                focus_ok, actual_target_window_id = focus_target_window_before_action(target_window_id, timeout_seconds)
+                if not focus_ok:
+                    result["error"] = structured_error(
+                        "focus_not_proven",
+                        f"desktop action was not executed because target window {target_window_id} could not be focused",
+                        retryable=True,
+                        safe_to_retry=True,
+                        recommended_next_tool="desktop.windows",
+                        expected_window_id=target_window_id,
+                        actual_window_id=actual_target_window_id,
+                    )
+                    metadata_started_at = now_ms()
+                    populate_read_metadata(result, health)
+                    record_stage_timing(result, "metadataMs", metadata_started_at)
+                    # Do not capture feedback for a focus precondition failure;
+                    # the caller can inspect windows and retry without paying
+                    # the screenshot/ffmpeg path.
+                    log_event(
+                        "desktop.action",
+                        {
+                            "action": action,
+                            "action_id": action_id,
+                            "outcome": "focus_not_proven",
+                            "expected_window_id": target_window_id,
+                            "actual_window_id": actual_target_window_id,
+                        },
+                    )
+                    return finish(result), 1
+            if action == "open_app":
+                command_ok, error_code, error_message, action_duration_ms = run_open_app_command(
+                    action_args,
+                    timeout_seconds,
+                )
+            elif action == "focus_window":
+                expected_window_id = str(metadata.get("expectedWindowId") or "")
+                command_ok, error_code, error_message, action_duration_ms, actual_window_id = focus_window_with_postcondition(
+                    action_args,
+                    expected_window_id,
+                    timeout_seconds,
+                )
+            else:
+                command_ok, error_code, error_message, action_duration_ms = run_action_command(
+                    action,
+                    action_args,
+                    timeout_seconds,
+                )
+    except TimeoutError:
+        record_stage_timing(result, "queueMs", queue_started_at)
+        result["error"] = structured_error(
+            "desktop_busy",
+            "desktop action lock is busy",
+            retryable=True,
+            safe_to_retry=True,
+            recommended_next_tool=f"desktop.{action}",
+        )
+        log_event("desktop.action", {"action": action, "action_id": action_id, "outcome": "desktop_busy"})
+        return finish(result), 1
+
+    result["timings"]["commandMs"] = max(0, action_duration_ms or 0)
+    metadata_started_at = now_ms()
+    populate_read_metadata(result, health)
+    record_stage_timing(result, "metadataMs", metadata_started_at)
+    if command_ok:
+        result["ok"] = True
+    elif error_code == "focus_not_proven":
+        expected_window_id = str(metadata.get("expectedWindowId") or "") or None
+        result["error"] = structured_error(
+            "focus_not_proven",
+            error_message or "desktop window focus could not be proven",
+            retryable=True,
+            safe_to_retry=action == "focus_window",
+            recommended_next_tool="desktop.windows",
+            expected_window_id=expected_window_id,
+            actual_window_id=active_window_id(),
+        )
+    else:
+        result["error"] = {"code": error_code or "action_failed", "message": error_message or "desktop action failed", "retryable": True}
+    capture_action_feedback(result, action_id, scenario_id, not command_ok)
+    try:
+        append_recording_action_trace(action, action_id, action_started, options, result)
+    except OSError:
+        log_event("desktop.action_trace", {"action_id": action_id, "outcome": "write_failed"})
+
+    outcome = "success" if result["ok"] else str(result["error"]["code"] if result["error"] else "failed")
+    log_event(
+        "desktop.action",
+        {
+            "action": action,
+            "action_id": action_id,
+            "outcome": outcome,
+            "duration_ms": action_duration_ms,
+            "typed_character_count": result["typedCharacterCount"],
+            "input_redacted": result["inputRedacted"] or None,
+            "warning_code": result["warning"]["code"] if result["warning"] else None,
+        },
+    )
+    return finish(result), 0 if result["ok"] else 1
+
+
+def query_display_size() -> tuple[int, int] | None:
+    if shutil.which("xdotool") is None:
+        return None
+    try:
+        result = run_command(["xdotool", "getdisplaygeometry"], READ_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def query_pointer() -> dict[str, int] | None:
+    if shutil.which("xdotool") is None:
+        return None
+    try:
+        result = run_command(["xdotool", "getmouselocation", "--shell"], READ_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    values: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in {"X", "Y"} and value.isdigit():
+            values[key] = int(value)
+    if "X" in values and "Y" in values:
+        return {"x": values["X"], "y": values["Y"]}
+    return None
+
+
+def parse_wmctrl_line(line: str) -> dict[str, Any] | None:
+    parts = line.rstrip("\n").split(None, 7)
+    if len(parts) < 8:
+        return None
+    window_id, desktop, x, y, width, height, _host, title = parts
+    try:
+        return {
+            "id": window_id,
+            "desktop": int(desktop),
+            "title": title,
+            "process": None,
+            "bounds": {"x": int(x), "y": int(y), "width": int(width), "height": int(height)},
+        }
+    except ValueError:
+        return None
+
+
+def parse_window_id(raw: str) -> int | None:
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        return int(value, 16) if value.lower().startswith("0x") else int(value, 10)
+    except ValueError:
+        return None
+
+
+def query_windows() -> list[dict[str, Any]]:
+    if shutil.which("wmctrl") is None:
+        return []
+    try:
+        result = run_command(["wmctrl", "-lG"], READ_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    windows: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        parsed = parse_wmctrl_line(line)
+        if parsed is not None:
+            windows.append(parsed)
+    return windows
+
+
+def query_active_window(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    active_window_id = None
+    if shutil.which("xdotool") is not None:
+        try:
+            result = run_command(["xdotool", "getactivewindow"], READ_TIMEOUT_SECONDS)
+            if result.returncode == 0:
+                active_window_id = parse_window_id(result.stdout)
+        except (OSError, subprocess.TimeoutExpired):
+            active_window_id = None
+    if active_window_id is not None:
+        for window in windows:
+            if parse_window_id(str(window["id"])) == active_window_id:
+                return {
+                    "id": window["id"],
+                    "title": window["title"],
+                    "process": window["process"],
+                    "bounds": window["bounds"],
+                }
+    return {"id": None, "title": None, "process": None, "bounds": None}
+
+
+def validate_scenario_id(raw: str) -> str | None:
+    if not SCENARIO_ID_PATTERN.match(raw):
+        return None
+    return raw
+
+
+def filename_safe_id(raw: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")
+    return safe[:80] or "action"
+
+
+def validated_http_url(raw: str) -> str | None:
+    value = raw.strip()
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    return value
+
+
+def chromium_executable() -> str | None:
+    identity = browser_runtime_identity()
+    resolved = identity.get("browserResolvedPath")
+    return resolved if identity.get("browserStatus") == "ready" and isinstance(resolved, str) else None
+
+
+def run_preflight_command(action: str, action_id: str, started_at_ms: int) -> tuple[dict[str, Any], int]:
+    result = empty_result(action, action_id, started_at_ms)
+    runtime = result["desktopRuntime"]
+    if runtime.get("browserStatus") == "ready":
+        result["ok"] = True
+        return finish(result), 0
+    configured = runtime.get("browserConfiguredPath")
+    detail = f" Configured path: {configured}." if configured else ""
+    result["error"] = structured_error(
+        "browser_missing",
+        f"Platform Chromium is missing or does not resolve inside the protected browser directory.{detail}",
+        retryable=True,
+        safe_to_retry=True,
+        recommended_next_tool=None,
+    )
+    log_event(
+        "desktop.preflight",
+        {
+            "outcome": "browser_missing",
+            "configured_path": configured,
+            "resolved_path": runtime.get("browserResolvedPath"),
+            "platform_protected": runtime.get("browserPlatformProtected"),
+            "supervisor_generation": runtime.get("supervisorGeneration"),
+        },
+    )
+    return finish(result), 1
+
+
+def scenario_dir(scenario_id: str) -> Path:
+    root = EVIDENCE_ROOT.resolve()
+    target = (root / scenario_id).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise ValueError("scenario path escapes evidence root")
+    return target
+
+
+def stage_runtime_evidence(source: Path, destination_name: str) -> str:
+    source = source.resolve()
+    if not source.is_file() or source.stat().st_size <= 0:
+        raise ValueError("evidence source is missing or empty")
+    destination_root = RUNTIME_EVIDENCE_ROOT.resolve()
+    destination_root.mkdir(parents=True, exist_ok=True)
+    destination = (destination_root / destination_name).resolve()
+    try:
+        destination.relative_to(destination_root)
+    except ValueError:
+        raise ValueError("runtime evidence destination escapes evidence root")
+    shutil.copy2(source, destination)
+    os.chmod(destination, 0o644)
+    return str(destination)
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+        handle.write("\n")
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, path)
+
+
+def load_recording_state() -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(RECORDING_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def write_recording_state(state: dict[str, Any]) -> None:
+    atomic_write_json(RECORDING_STATE_PATH, state)
+
+
+def label_hash(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+
+
+def option_is_true(options: dict[str, Any], name: str) -> bool:
+    raw = options.get(name)
+    if raw is True:
+        return True
+    if not isinstance(raw, str):
+        return False
+    return raw.strip().lower() in {"1", "true", "yes"}
+
+
+def process_alive(pid: int | None) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def safe_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def wait_for_process_exit(pid: int | None, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not process_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not process_alive(pid)
+
+
+def signal_recording_process(state: dict[str, Any], sig: signal.Signals) -> None:
+    pid = safe_int(state.get("pid"))
+    pgid = safe_int(state.get("processGroupId"))
+    if pgid and pgid > 1 and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if pid:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+
+def stop_recording_process(state: dict[str, Any]) -> None:
+    pid = safe_int(state.get("pid"))
+    if not process_alive(pid):
+        return
+    signal_recording_process(state, signal.SIGINT)
+    if wait_for_process_exit(pid, RECORDING_STOP_GRACE_SECONDS):
+        return
+    signal_recording_process(state, signal.SIGTERM)
+    if wait_for_process_exit(pid, 1.0):
+        return
+    signal_recording_process(state, signal.SIGKILL)
+    wait_for_process_exit(pid, 1.0)
+
+
+def recording_exit_code(state: dict[str, Any]) -> int | None:
+    raw_path = state.get("exitCodePath")
+    if not isinstance(raw_path, str):
+        return None
+    try:
+        raw = Path(raw_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def recording_file_bytes(path: str | None) -> int | None:
+    if not path:
+        return None
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return None
+
+
+def read_screenshot_metadata(path: Path) -> dict[str, Any] | None:
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return None
+        with path.open("rb") as handle:
+            header = handle.read(64 * 1024)
+    except OSError:
+        return None
+
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        dimensions = parse_webp_dimensions(header, size)
+        return {"mimeType": WEBP_MIME_TYPE, "width": dimensions[0], "height": dimensions[1]} if dimensions else None
+    if header.startswith(b"\x89PNG\r\n\x1a\n") and header[12:16] == b"IHDR" and len(header) >= 24:
+        return {"mimeType": "image/png", "width": int.from_bytes(header[16:20], "big"), "height": int.from_bytes(header[20:24], "big")}
+    dimensions = parse_jpeg_dimensions(header)
+    if dimensions:
+        return {"mimeType": "image/jpeg", "width": dimensions[0], "height": dimensions[1]}
+    return None
+
+
+def parse_webp_dimensions(data: bytes, file_size: int) -> tuple[int, int] | None:
+    if len(data) < 16 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    riff_size = int.from_bytes(data[4:8], "little")
+    if riff_size < 4 or riff_size + 8 > file_size:
+        return None
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk_type = data[offset : offset + 4]
+        chunk_size = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        payload_start = offset + 8
+        payload_end = payload_start + chunk_size
+        if payload_end > len(data):
+            return None
+        payload = data[payload_start:payload_end]
+        if chunk_type == b"VP8X" and len(payload) >= 10:
+            width = 1 + int.from_bytes(payload[4:7], "little")
+            height = 1 + int.from_bytes(payload[7:10], "little")
+            return width, height
+        if chunk_type == b"VP8 " and len(payload) >= 10 and payload[3:6] == b"\x9d\x01\x2a":
+            width = int.from_bytes(payload[6:8], "little") & 0x3FFF
+            height = int.from_bytes(payload[8:10], "little") & 0x3FFF
+            return width, height
+        if chunk_type == b"VP8L" and len(payload) >= 5 and payload[0] == 0x2F:
+            width = 1 + ((payload[1] | (payload[2] << 8)) & 0x3FFF)
+            height = 1 + (((payload[2] >> 6) | (payload[3] << 2) | (payload[4] << 10)) & 0x3FFF)
+            return width, height
+        offset = payload_end + (chunk_size & 1)
+    return None
+
+
+def parse_jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    offset = 2
+    while offset + 9 < len(data):
+        if data[offset] != 0xFF:
+            return None
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        marker = data[offset]
+        offset += 1
+        if marker in {0xD9, 0xDA} or offset + 2 > len(data):
+            return None
+        segment_length = int.from_bytes(data[offset : offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return None
+        if marker in {
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC5,
+            0xC6,
+            0xC7,
+            0xC9,
+            0xCA,
+            0xCB,
+            0xCD,
+            0xCE,
+            0xCF,
+        }:
+            return int.from_bytes(data[offset + 5 : offset + 7], "big"), int.from_bytes(data[offset + 3 : offset + 5], "big")
+        offset += segment_length
+    return None
+
+
+def screenshot_metadata_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.metadata.json")
+
+
+def scan_manifest_screenshots(scenario_id: str) -> list[dict[str, Any]]:
+    try:
+        candidates = list(scenario_dir(scenario_id).glob("*"))
+    except OSError:
+        return []
+    paths: list[tuple[Path, float]] = []
+    for path in candidates:
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            continue
+        paths.append((path, modified_at))
+    screenshots: list[dict[str, Any]] = []
+    for path, _modified_at in sorted(paths, key=lambda item: item[1]):
+        if not path.is_file() or path.suffix.lower() not in SCREENSHOT_EXTENSIONS:
+            continue
+        name_parts = path.stem.split("-")
+        purpose = name_parts[-1] if name_parts and name_parts[-1] in {"action_feedback", "observe", "proof_candidate"} else "observe"
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        metadata = read_screenshot_metadata(path)
+        if not metadata:
+            continue
+        encoding_mode = "legacy"
+        try:
+            sidecar = json.loads(screenshot_metadata_path(path).read_text(encoding="utf-8"))
+            if isinstance(sidecar, dict) and sidecar.get("encodingMode") in {"lossless", "q88", "q80", "legacy"}:
+                encoding_mode = str(sidecar["encodingMode"])
+        except (OSError, json.JSONDecodeError):
+            pass
+        screenshots.append(
+            {
+                "id": path.stem,
+                "path": str(path.resolve()),
+                "purpose": purpose,
+                "bytes": size,
+                "encodedBytes": size,
+                "mimeType": metadata["mimeType"],
+                "extension": path.suffix.lower(),
+                "width": metadata["width"],
+                "height": metadata["height"],
+                "encodingMode": encoding_mode,
+            },
+        )
+    return screenshots
+
+
+def sanitized_manifest_actions(state: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_actions = state.get("actions")
+    if not isinstance(raw_actions, list):
+        return []
+    sanitized: list[dict[str, Any]] = []
+    for raw_action in raw_actions:
+        if not isinstance(raw_action, dict):
+            continue
+        action_id = str(raw_action.get("actionId") or "")
+        action_type = str(raw_action.get("type") or "")
+        at_ms = safe_int(raw_action.get("atMs"))
+        if not action_id or not action_type or at_ms is None:
+            continue
+        x = safe_int(raw_action.get("x"))
+        y = safe_int(raw_action.get("y"))
+        typed_character_count = safe_int(raw_action.get("typedCharacterCount"))
+        active_window_title = raw_action.get("activeWindowTitle")
+        screenshot_id = raw_action.get("screenshotId")
+        sanitized.append(
+            {
+                "actionId": action_id,
+                "type": action_type,
+                "atMs": at_ms,
+                "x": x,
+                "y": y,
+                "activeWindowTitle": active_window_title if isinstance(active_window_title, str) else None,
+                "screenshotId": screenshot_id if isinstance(screenshot_id, str) and screenshot_id else None,
+                "typedCharacterCount": typed_character_count,
+                "inputRedacted": bool(raw_action.get("inputRedacted")),
+            },
+        )
+    return sanitized
+
+
+def screenshot_id_from_result(result: dict[str, Any]) -> str | None:
+    screenshot = result.get("screenshot")
+    if not isinstance(screenshot, dict):
+        return None
+    path = screenshot.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    return Path(path).stem
+
+
+def action_trace_point(action: str, options: dict[str, Any]) -> tuple[int | None, int | None]:
+    if action in {"click", "scroll"}:
+        x = safe_int(options.get("x"))
+        y = safe_int(options.get("y"))
+        return x, y
+    if action == "drag":
+        x = safe_int(options.get("to-x"))
+        y = safe_int(options.get("to-y"))
+        return x, y
+    return None, None
+
+
+def append_recording_action_trace(
+    action: str,
+    action_id: str,
+    at_ms: int,
+    options: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    state = load_recording_state()
+    if not state or state.get("status") != "recording":
+        return
+    x, y = action_trace_point(action, options)
+    active_window = result.get("activeWindow") if isinstance(result.get("activeWindow"), dict) else {}
+    existing_actions = state.get("actions") if isinstance(state.get("actions"), list) else []
+    entry = {
+        "actionId": action_id,
+        "type": action,
+        "atMs": at_ms,
+        "x": x,
+        "y": y,
+        "activeWindowTitle": active_window.get("title") if isinstance(active_window.get("title"), str) else None,
+        "screenshotId": screenshot_id_from_result(result),
+        "typedCharacterCount": result.get("typedCharacterCount") if isinstance(result.get("typedCharacterCount"), int) else None,
+        "inputRedacted": bool(result.get("inputRedacted")),
+    }
+    updated = {**state, "actions": [*existing_actions, entry]}
+    write_recording_state(updated)
+    manifest_path = updated.get("manifestPath")
+    if isinstance(manifest_path, str) and manifest_path:
+        try:
+            atomic_write_json(Path(manifest_path), build_recording_manifest(updated, "interrupted", None, None, None, None))
+        except OSError:
+            log_event("desktop.action_trace", {"action_id": action_id, "outcome": "manifest_update_failed"})
+
+
+def ffmpeg_enable_expr(start_seconds: float, duration_seconds: float) -> str:
+    end_seconds = max(start_seconds, start_seconds + duration_seconds)
+    return f"between(t\\,{start_seconds:.3f}\\,{end_seconds:.3f})"
+
+
+def overlay_filters(actions: list[dict[str, Any]], started_at_ms: int, display: dict[str, Any]) -> list[str]:
+    width = int(display.get("width") or 1280)
+    height = int(display.get("height") or 720)
+    filters: list[str] = []
+    for action in actions:
+        at_ms = safe_int(action.get("atMs"))
+        if at_ms is None:
+            continue
+        start_seconds = max(0.0, (at_ms - started_at_ms) / 1000.0)
+        action_type = str(action.get("type") or "")
+        if action_type == "click":
+            x = safe_int(action.get("x"))
+            y = safe_int(action.get("y"))
+            if x is None or y is None:
+                continue
+            left = max(0, min(width - 1, x - 18))
+            top = max(0, min(height - 1, y - 18))
+            box_width = min(36, max(1, width - left))
+            box_height = min(36, max(1, height - top))
+            filters.append(
+                f"drawbox=x={left}:y={top}:w={box_width}:h={box_height}:color=yellow@0.85:t=4:enable='{ffmpeg_enable_expr(start_seconds, 0.55)}'"
+            )
+        elif action_type == "type":
+            typed_count = safe_int(action.get("typedCharacterCount"))
+            if typed_count is None or typed_count <= 0:
+                continue
+            enable = ffmpeg_enable_expr(start_seconds, 0.8)
+            filters.append(f"drawbox=x=18:y=h-62:w=190:h=34:color=black@0.55:t=fill:enable='{enable}'")
+            filters.append(f"drawtext=text='Typing':x=34:y=h-52:fontcolor=white:fontsize=18:enable='{enable}'")
+    return filters
+
+
+def run_overlay_ffmpeg(raw_webm_path: Path, overlay_webm_path: Path, filters: list[str]) -> tuple[bool, str | None]:
+    if not filters:
+        try:
+            shutil.copy2(raw_webm_path, overlay_webm_path)
+            os.chmod(overlay_webm_path, 0o600)
+            return True, None
+        except OSError as err:
+            return False, str(err)
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-i",
+        str(raw_webm_path),
+        "-vf",
+        ",".join(filters),
+        "-an",
+        "-c:v",
+        "libvpx",
+        "-deadline",
+        "realtime",
+        "-cpu-used",
+        "8",
+        "-b:v",
+        "1200k",
+        "-y",
+        str(overlay_webm_path),
+    ]
+    try:
+        result = run_command(args, RECORDING_OVERLAY_TIMEOUT_SECONDS)
+    except TimeoutExpired:
+        return False, "overlay_timeout"
+    except OSError:
+        return False, "overlay_failed_to_start"
+    if result.returncode != 0:
+        return False, f"overlay_exit_{result.returncode}"
+    try:
+        if overlay_webm_path.stat().st_size <= 0:
+            return False, "empty_overlay"
+        os.chmod(overlay_webm_path, 0o600)
+    except OSError:
+        return False, "overlay_file_missing"
+    return True, None
+
+
+def apply_recording_overlays(
+    state: dict[str, Any],
+    raw_webm_path: str | None,
+    started_at_ms: int,
+    display: dict[str, Any],
+) -> tuple[str | None, str, str | None, int | None]:
+    if not raw_webm_path:
+        return None, "not_attempted", None, None
+    raw_path = Path(raw_webm_path)
+    safe_recording_id = filename_safe_id(str(state.get("recordingId") or "recording"))
+    scenario_id = str(state.get("scenarioId") or "default")
+    try:
+        overlay_path = (scenario_dir(scenario_id) / f"{safe_recording_id}-walkthrough-overlay.webm").resolve()
+    except ValueError as err:
+        return None, "failed", str(err), None
+    actions = sanitized_manifest_actions(state)
+    filters = overlay_filters(actions, started_at_ms, display)
+    ok, failure_reason = run_overlay_ffmpeg(raw_path, overlay_path, filters)
+    if not ok:
+        try:
+            overlay_path.unlink()
+        except OSError:
+            pass
+        log_event(
+            "desktop.recording_overlay",
+            {
+                "recording_id": state.get("recordingId"),
+                "scenario_id": scenario_id,
+                "outcome": "failed",
+                "reason": failure_reason,
+            },
+        )
+        return None, "failed", failure_reason or "overlay_failed", None
+    overlay_bytes = recording_file_bytes(str(overlay_path))
+    log_event(
+        "desktop.recording_overlay",
+        {
+            "recording_id": state.get("recordingId"),
+            "scenario_id": scenario_id,
+            "outcome": "applied",
+            "actions": len(actions),
+            "filters": len(filters),
+            "bytes": overlay_bytes,
+        },
+    )
+    return str(overlay_path), "applied", None, overlay_bytes
+
+
+def build_recording_manifest(
+    state: dict[str, Any],
+    status: str,
+    stopped_at_ms: int | None,
+    duration_ms: int | None,
+    bytes_value: int | None,
+    failure_reason: str | None,
+) -> dict[str, Any]:
+    scenario_id = str(state.get("scenarioId") or "default")
+    display = state.get("display") if isinstance(state.get("display"), dict) else {"width": 0, "height": 0, "scale": 1}
+    overlay_webm_path = state.get("overlayWebmPath") if isinstance(state.get("overlayWebmPath"), str) else None
+    evidence_path = state.get("evidencePath") if isinstance(state.get("evidencePath"), str) else None
+    overlay_status = state.get("overlayStatus") if state.get("overlayStatus") in {"applied", "failed", "not_attempted"} else "not_attempted"
+    return {
+        "version": 1,
+        "scenarioId": scenario_id,
+        "label": str(state.get("label") or ""),
+        "display": {
+            "width": int(display.get("width") or 0),
+            "height": int(display.get("height") or 0),
+            "scale": 1,
+        },
+        "recording": {
+            "status": status,
+            "startedAtMs": int(state.get("startedAtMs") or 0),
+            "stoppedAtMs": stopped_at_ms,
+            "durationMs": duration_ms,
+            "rawWebmPath": state.get("rawWebmPath") if isinstance(state.get("rawWebmPath"), str) else None,
+            "overlayWebmPath": overlay_webm_path,
+            "evidencePath": evidence_path,
+            "bytes": bytes_value,
+            "codec": "vp8",
+            "fps": RECORDING_FPS,
+            "overlayStatus": overlay_status,
+            "failureReason": failure_reason,
+        },
+        "screenshots": scan_manifest_screenshots(scenario_id),
+        "actions": sanitized_manifest_actions(state),
+    }
+
+
+def finalize_recording(
+    state: dict[str, Any],
+    requested_status: str,
+    failure_reason: str | None = None,
+    stopped_at_ms: int | None = None,
+) -> dict[str, Any]:
+    stopped_at_ms = stopped_at_ms or now_ms()
+    started_at_ms = int(state.get("startedAtMs") or stopped_at_ms)
+    duration_ms = max(0, stopped_at_ms - started_at_ms)
+    raw_webm_path = state.get("rawWebmPath") if isinstance(state.get("rawWebmPath"), str) else None
+    bytes_value = recording_file_bytes(raw_webm_path)
+    if raw_webm_path:
+        try:
+            os.chmod(raw_webm_path, 0o600)
+        except OSError:
+            pass
+    final_status = requested_status
+    final_reason = failure_reason
+    if requested_status == "completed":
+        if bytes_value is None or bytes_value <= 0:
+            final_status = "failed"
+            final_reason = final_reason or "empty_recording"
+        elif bytes_value > int(state.get("maxBytes") or RECORDING_MAX_BYTES):
+            final_status = "failed"
+            final_reason = final_reason or "size_limit_exceeded"
+
+    overlay_webm_path = None
+    overlay_status = "not_attempted"
+    overlay_bytes = None
+    if final_status == "completed":
+        overlay_webm_path, overlay_status, overlay_failure_reason, overlay_bytes = apply_recording_overlays(
+            state,
+            raw_webm_path,
+            started_at_ms,
+            state.get("display") if isinstance(state.get("display"), dict) else {"width": 0, "height": 0, "scale": 1},
+        )
+        if overlay_status == "failed":
+            final_reason = final_reason or overlay_failure_reason or "overlay_failed"
+        elif overlay_bytes is not None:
+            bytes_value = overlay_bytes
+
+    ready_for_evidence = (
+        final_status == "completed"
+        and overlay_status == "applied"
+        and overlay_webm_path is not None
+        and bytes_value is not None
+        and bytes_value <= int(state.get("maxBytes") or RECORDING_MAX_BYTES)
+        and duration_ms <= int(state.get("maxDurationMs") or RECORDING_MAX_DURATION_MS)
+    )
+
+    if final_status == "completed" and not ready_for_evidence:
+        final_status = "failed"
+        if overlay_status != "applied" or overlay_webm_path is None:
+            final_reason = final_reason or "overlay_not_available"
+        elif duration_ms > int(state.get("maxDurationMs") or RECORDING_MAX_DURATION_MS):
+            final_reason = final_reason or "duration_limit_exceeded"
+        else:
+            final_reason = final_reason or "recording_not_eligible_for_evidence"
+
+    evidence_path = None
+    if ready_for_evidence and overlay_webm_path is not None:
+        scenario_id = filename_safe_id(str(state.get("scenarioId") or "default"))
+        recording_id = filename_safe_id(str(state.get("recordingId") or "recording"))
+        try:
+            evidence_path = stage_runtime_evidence(
+                Path(overlay_webm_path),
+                f"desktop-{scenario_id}-{recording_id}-walkthrough.webm",
+            )
+            log_event(
+                "desktop.evidence_staged",
+                {"artifact_type": "video", "scenario_id": scenario_id, "bytes": bytes_value},
+            )
+        except (OSError, ValueError) as err:
+            final_status = "failed"
+            final_reason = f"evidence_stage_failed: {err}"
+
+    manifest_state = {
+        **state,
+        "overlayWebmPath": overlay_webm_path,
+        "overlayStatus": overlay_status,
+        "evidencePath": evidence_path,
+    }
+    manifest = build_recording_manifest(manifest_state, final_status, stopped_at_ms, duration_ms, bytes_value, final_reason)
+
+    manifest_path = Path(str(state.get("manifestPath")))
+    atomic_write_json(manifest_path, manifest)
+
+    updated = {
+        **state,
+        **manifest_state,
+        "status": final_status,
+        "stoppedAtMs": stopped_at_ms,
+        "durationMs": duration_ms,
+        "bytes": bytes_value,
+        "failureReason": final_reason,
+        "manifestPath": str(manifest_path),
+    }
+    write_recording_state(updated)
+
+    common = {
+        "recording_id": updated.get("recordingId"),
+        "scenario_id": updated.get("scenarioId"),
+        "duration_ms": duration_ms,
+        "bytes": bytes_value,
+    }
+    if final_status == "completed":
+        log_event(
+            "desktop.recording_stop",
+            {**common, "overlay_status": overlay_status, "evidence_staged": evidence_path is not None},
+        )
+    elif final_status in {"failed", "interrupted"}:
+        log_event(
+            "desktop.recording_failed",
+            {**common, "reason": final_reason or final_status, "partial_artifacts_present": bool(bytes_value)},
+        )
+    return updated
+
+
+def recording_payload(state: dict[str, Any] | None) -> dict[str, Any]:
+    if not state:
+        return {
+            "status": "idle",
+            "recordingId": None,
+            "scenarioId": None,
+            "label": None,
+            "manifestPath": None,
+            "rawWebmPath": None,
+            "overlayWebmPath": None,
+            "evidencePath": None,
+            "overlayStatus": "not_attempted",
+            "startedAtMs": None,
+            "stoppedAtMs": None,
+            "durationMs": None,
+            "bytes": None,
+            "maxDurationMs": RECORDING_MAX_DURATION_MS,
+            "maxBytes": RECORDING_MAX_BYTES,
+            "fps": RECORDING_FPS,
+            "codec": "vp8",
+            "failureReason": None,
+        }
+    return {
+        "status": state.get("status") or "idle",
+        "recordingId": state.get("recordingId"),
+        "scenarioId": state.get("scenarioId"),
+        "label": state.get("label"),
+        "manifestPath": state.get("manifestPath"),
+        "rawWebmPath": state.get("rawWebmPath"),
+        "overlayWebmPath": state.get("overlayWebmPath"),
+        "evidencePath": state.get("evidencePath"),
+        "overlayStatus": state.get("overlayStatus") or "not_attempted",
+        "startedAtMs": state.get("startedAtMs"),
+        "stoppedAtMs": state.get("stoppedAtMs"),
+        "durationMs": state.get("durationMs"),
+        "bytes": state.get("bytes"),
+        "maxDurationMs": state.get("maxDurationMs") or RECORDING_MAX_DURATION_MS,
+        "maxBytes": state.get("maxBytes") or RECORDING_MAX_BYTES,
+        "fps": state.get("fps") or RECORDING_FPS,
+        "codec": "vp8",
+        "failureReason": state.get("failureReason"),
+    }
+
+
+def recording_display(health: dict[str, Any] | None) -> dict[str, Any]:
+    dimensions = query_display_size()
+    if dimensions is not None:
+        return {"width": dimensions[0], "height": dimensions[1], "scale": 1}
+    return display_from_health(health)
+
+
+def build_ffmpeg_args(display: dict[str, Any], raw_webm_path: Path, max_duration_ms: int, max_bytes: int) -> list[str]:
+    width = int(display.get("width") or 1280)
+    height = int(display.get("height") or 720)
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-f",
+        "x11grab",
+        "-draw_mouse",
+        "1",
+        "-framerate",
+        str(RECORDING_FPS),
+        "-video_size",
+        f"{width}x{height}",
+        "-i",
+        DISPLAY_VALUE,
+        "-t",
+        f"{max_duration_ms / 1000:.3f}",
+        "-an",
+        "-c:v",
+        "libvpx",
+        "-deadline",
+        "realtime",
+        "-cpu-used",
+        "8",
+        "-b:v",
+        "1200k",
+        "-fs",
+        str(max_bytes),
+        "-y",
+        str(raw_webm_path),
+    ]
+
+
+def launch_recording_process(ffmpeg_args: list[str], exit_code_path: Path, log_path: Path) -> subprocess.Popen[str]:
+    wrapper = """
+import json
+import signal
+import subprocess
+import sys
+
+exit_path = sys.argv[1]
+args = json.loads(sys.argv[2])
+code = 1
+process = None
+try:
+    process = subprocess.Popen(args)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    code = process.wait()
+except KeyboardInterrupt:
+    if process is not None:
+        code = process.wait()
+    else:
+        code = 130
+except BaseException:
+    code = 1
+    raise
+finally:
+    try:
+        with open(exit_path, "w", encoding="utf-8") as handle:
+            handle.write(str(code))
+            handle.write("\\n")
+    except OSError:
+        pass
+sys.exit(code)
+"""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("a", encoding="utf-8")
+    env = os.environ.copy()
+    env["DISPLAY"] = DISPLAY_VALUE
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-c", wrapper, str(exit_code_path), json.dumps(ffmpeg_args)],
+            env=env,
+            stdout=log_handle,
+            stderr=log_handle,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
+
+
+def finalize_inactive_recording(state: dict[str, Any]) -> dict[str, Any]:
+    exit_code = recording_exit_code(state)
+    if exit_code == 0:
+        return finalize_recording(state, "completed")
+    if exit_code is None:
+        return finalize_recording(state, "interrupted", "stale_recording")
+    return finalize_recording(state, "failed", f"ffmpeg_exit_{exit_code}")
+
+
+def active_recording_timed_out(state: dict[str, Any]) -> bool:
+    started_at_ms = int(state.get("startedAtMs") or 0)
+    max_duration_ms = int(state.get("maxDurationMs") or RECORDING_MAX_DURATION_MS)
+    return started_at_ms > 0 and now_ms() - started_at_ms > max_duration_ms + 5000
+
+
+def run_record_start(
+    action: str,
+    action_id: str,
+    started_at_ms: int,
+    options: dict[str, Any],
+    scenario_id: str,
+) -> tuple[dict[str, Any], int]:
+    result = empty_result(action, action_id, started_at_ms)
+    label, label_error = require_non_empty_option(options, "label")
+    if label_error:
+        result["error"] = {"code": "invalid_request", "message": label_error, "retryable": False}
+        return finish(result), 2
+    if not option_is_true(options, "acknowledge-no-secrets"):
+        result["error"] = {
+            "code": "invalid_request",
+            "message": "--acknowledge-no-secrets must be true",
+            "retryable": False,
+        }
+        return finish(result), 2
+
+    health, readiness = ensure_desktop_available()
+    set_desktop_readiness(result, readiness)
+    result["display"] = display_from_health(health)
+    if not desktop_is_available(health):
+        result["error"] = unavailable_error(health)
+        log_event("desktop.recording_failed", {"scenario_id": scenario_id, "reason": "desktop_unavailable"})
+        return finish(result), 1
+    if shutil.which("ffmpeg") is None:
+        result["error"] = {"code": "desktop_unavailable", "message": "ffmpeg is not available", "retryable": True}
+        log_event("desktop.recording_failed", {"scenario_id": scenario_id, "reason": "ffmpeg_missing"})
+        return finish(result), 1
+
+    try:
+        with desktop_action_lock():
+            existing = load_recording_state()
+            if existing and existing.get("status") == "recording":
+                existing_pid = safe_int(existing.get("pid"))
+                if process_alive(existing_pid):
+                    if active_recording_timed_out(existing):
+                        stop_recording_process(existing)
+                        finalize_recording(existing, "interrupted", "stale_recording_after_resume")
+                    else:
+                        result["error"] = {
+                            "code": "recording_already_active",
+                            "message": "A desktop recording is already active.",
+                            "retryable": False,
+                        }
+                        result["recording"] = recording_payload(existing)
+                        return finish(result), 1
+                else:
+                    finalize_inactive_recording(existing)
+
+            recording_id = str(options.get("recording-id") or f"rec-{uuid.uuid4().hex[:16]}")
+            safe_recording_id = filename_safe_id(recording_id)
+            target_dir = scenario_dir(scenario_id)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            raw_webm_path = (target_dir / f"{safe_recording_id}-walkthrough.webm").resolve()
+            manifest_path = (target_dir / f"{safe_recording_id}-manifest.json").resolve()
+            exit_code_path = (target_dir / f".{safe_recording_id}-ffmpeg-exit").resolve()
+            display = recording_display(health)
+            max_duration_ms = RECORDING_MAX_DURATION_MS
+            max_bytes = RECORDING_MAX_BYTES
+            ffmpeg_args = build_ffmpeg_args(display, raw_webm_path, max_duration_ms, max_bytes)
+            process = launch_recording_process(ffmpeg_args, exit_code_path, LOG_PATH.parent / "desktop-recording-ffmpeg.log")
+            state = {
+                "status": "recording",
+                "recordingId": recording_id,
+                "scenarioId": scenario_id,
+                "label": label,
+                "startedAtMs": now_ms(),
+                "stoppedAtMs": None,
+                "durationMs": None,
+                "bytes": None,
+                "rawWebmPath": str(raw_webm_path),
+                "overlayWebmPath": None,
+                "evidencePath": None,
+                "overlayStatus": "not_attempted",
+                "manifestPath": str(manifest_path),
+                "exitCodePath": str(exit_code_path),
+                "pid": process.pid,
+                "processGroupId": process.pid,
+                "display": display,
+                "maxDurationMs": max_duration_ms,
+                "maxBytes": max_bytes,
+                "fps": RECORDING_FPS,
+                "failureReason": None,
+                "actions": [],
+            }
+            write_recording_state(state)
+            atomic_write_json(manifest_path, build_recording_manifest(state, "interrupted", None, None, None, None))
+            result["ok"] = True
+            result["display"] = display
+            result["recording"] = recording_payload(state)
+            log_event(
+                "desktop.recording_start",
+                {
+                    "recording_id": recording_id,
+                    "scenario_id": scenario_id,
+                    "label_hash": label_hash(label),
+                    "display": f"{display['width']}x{display['height']}",
+                    "max_duration_ms": max_duration_ms,
+                    "max_bytes": max_bytes,
+                },
+            )
+            return finish(result), 0
+    except TimeoutError:
+        result["error"] = {"code": "desktop_busy", "message": "desktop action lock is busy", "retryable": True}
+        return finish(result), 1
+    except (OSError, RuntimeError, ValueError) as err:
+        result["error"] = {"code": "recording_failed", "message": str(err), "retryable": True}
+        log_event("desktop.recording_failed", {"scenario_id": scenario_id, "reason": "start_failed"})
+        return finish(result), 1
+
+
+def run_record_stop(
+    action: str,
+    action_id: str,
+    started_at_ms: int,
+    options: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    result = empty_result(action, action_id, started_at_ms)
+    try:
+        with desktop_action_lock():
+            state = load_recording_state()
+            if not state or state.get("status") != "recording":
+                result["error"] = {"code": "not_recording", "message": "No desktop recording is active.", "retryable": False}
+                result["recording"] = recording_payload(state)
+                return finish(result), 1
+            reason = str(options.get("reason") or "operator_stop")
+            interrupted = reason in {"interrupted", "pause", "resume", "stale"}
+            pid = safe_int(state.get("pid"))
+            if process_alive(pid):
+                stop_recording_process(state)
+                exit_code = recording_exit_code(state)
+                if process_alive(pid):
+                    finalized = finalize_recording(state, "failed", "ffmpeg_still_running")
+                elif exit_code is None:
+                    finalized = finalize_recording(state, "failed", "ffmpeg_exit_unknown")
+                elif exit_code != 0:
+                    finalized = finalize_recording(state, "failed", f"ffmpeg_exit_{exit_code}")
+                else:
+                    finalized = finalize_recording(state, "interrupted" if interrupted else "completed", reason if interrupted else None)
+            else:
+                finalized = finalize_inactive_recording(state)
+            result["recording"] = recording_payload(finalized)
+            result["display"] = finalized.get("display") if isinstance(finalized.get("display"), dict) else result["display"]
+            if finalized.get("status") == "failed":
+                result["error"] = {
+                    "code": "recording_failed",
+                    "message": str(finalized.get("failureReason") or "desktop recording failed"),
+                    "retryable": False,
+                }
+                return finish(result), 1
+            if finalized.get("overlayStatus") == "failed":
+                result["error"] = {
+                    "code": "recording_failed",
+                    "message": str(finalized.get("failureReason") or "desktop recording overlay failed"),
+                    "retryable": False,
+                    "retryable": True,
+                }
+                return finish(result), 1
+            result["ok"] = True
+            return finish(result), 0
+    except TimeoutError:
+        result["error"] = {"code": "desktop_busy", "message": "desktop action lock is busy", "retryable": True}
+        return finish(result), 1
+
+
+def run_record_status(
+    action: str,
+    action_id: str,
+    started_at_ms: int,
+    options: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    result = empty_result(action, action_id, started_at_ms)
+    state = load_recording_state()
+    if not state:
+        result["ok"] = True
+        result["recording"] = recording_payload(None)
+        return finish(result), 0
+
+    if state.get("status") == "recording":
+        pid = safe_int(state.get("pid"))
+        if options.get("resume-check") is True:
+            try:
+                with desktop_action_lock():
+                    state = load_recording_state() or state
+                    if state.get("status") == "recording":
+                        stop_recording_process(state)
+                        state = finalize_recording(state, "interrupted", "resume_check")
+            except TimeoutError:
+                result["error"] = {"code": "desktop_busy", "message": "desktop action lock is busy", "retryable": True}
+                result["recording"] = recording_payload(state)
+                return finish(result), 1
+        elif process_alive(pid):
+            result["ok"] = True
+            result["recording"] = recording_payload(state)
+            result["display"] = state.get("display") if isinstance(state.get("display"), dict) else result["display"]
+            return finish(result), 0
+        else:
+            state = finalize_inactive_recording(state)
+
+    result["ok"] = True
+    result["recording"] = recording_payload(state)
+    result["display"] = state.get("display") if isinstance(state.get("display"), dict) else result["display"]
+    return finish(result), 0
+
+
+def current_quota_usage() -> tuple[int, int]:
+    count = 0
+    total_bytes = 0
+    try:
+        for path in EVIDENCE_ROOT.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in SCREENSHOT_EXTENSIONS:
+                continue
+            count += 1
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        return count, total_bytes
+    return count, total_bytes
+
+
+def quota_allows_capture() -> tuple[bool, str | None]:
+    count, total_bytes = current_quota_usage()
+    if count >= MAX_SCREENSHOTS_PER_SESSION:
+        return False, "screenshot count quota exceeded"
+    if total_bytes >= MAX_RAW_BYTES_PER_SESSION:
+        return False, "raw screenshot byte quota exceeded"
+    return True, None
+
+
+def run_screenshot_capture_command(args: list[str], temp_path: Path) -> bool:
+    try:
+        result = run_command(args, SCREENSHOT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and temp_path.is_file() and temp_path.stat().st_size > 0
+
+
+def capture_with_scrot(temp_path: Path) -> bool:
+    if shutil.which("scrot") is None:
+        return False
+    return run_screenshot_capture_command(["scrot", str(temp_path)], temp_path)
+
+
+def capture_with_ffmpeg(temp_path: Path, width: int, height: int) -> bool:
+    if shutil.which("ffmpeg") is None:
+        return False
+    return run_screenshot_capture_command(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "x11grab",
+            "-video_size",
+            f"{width}x{height}",
+            "-i",
+            f"{DISPLAY_VALUE}+0,0",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            "libwebp",
+            "-lossless",
+            "1",
+            "-f",
+            "webp",
+            "-y",
+            str(temp_path),
+        ],
+        temp_path,
+    )
+
+
+def transcode_webp(temp_input: Path, temp_output: Path, quality: int) -> bool:
+    if shutil.which("ffmpeg") is None:
+        return False
+    return run_screenshot_capture_command(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(temp_input),
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            "libwebp",
+            "-lossless",
+            "0",
+            "-q:v",
+            str(quality),
+            "-f",
+            "webp",
+            "-y",
+            str(temp_output),
+        ],
+        temp_output,
+    )
+
+
+def validate_webp(path: Path, expected_dimensions: tuple[int, int]) -> tuple[int, int]:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            header = handle.read(64 * 1024)
+    except OSError as err:
+        raise ScreenshotCaptureError("screenshot WebP was not written") from err
+    dimensions = parse_webp_dimensions(header, size)
+    if size <= 0 or not dimensions:
+        raise ScreenshotCaptureError("screenshot output is not a valid WebP")
+    if dimensions != expected_dimensions:
+        raise ScreenshotCaptureError(
+            f"screenshot WebP dimensions {dimensions[0]}x{dimensions[1]} do not match display "
+            f"{expected_dimensions[0]}x{expected_dimensions[1]}"
+        )
+    return dimensions
+
+
+def record_screenshot_timings(result: dict[str, Any], screenshot: dict[str, Any], started_at_ms: int) -> None:
+    capture_ms = screenshot.pop("_captureMs", None)
+    encode_ms = screenshot.pop("_encodeMs", None)
+    result["timings"]["screenshotEncodeMs"] = encode_ms if isinstance(encode_ms, int) else 0
+    if isinstance(capture_ms, int):
+        result["timings"]["screenshotCaptureMs"] = max(0, capture_ms + result["timings"]["screenshotEncodeMs"])
+    else:
+        record_stage_timing(result, "screenshotCaptureMs", started_at_ms)
+
+
+def capture_screenshot(action_id: str, scenario_id: str, purpose: str) -> dict[str, Any]:
+    target_dir = scenario_dir(scenario_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{int(time.time() * 1000)}-{filename_safe_id(action_id)}-{purpose}.webp"
+    target = (target_dir / filename).resolve()
+    try:
+        target.relative_to(EVIDENCE_ROOT.resolve())
+    except ValueError:
+        raise ValueError("screenshot path escapes evidence root")
+
+    dimensions = query_display_size()
+    if dimensions is None or dimensions[0] <= 0 or dimensions[1] <= 0:
+        raise ScreenshotCaptureError("desktop display dimensions are unavailable")
+    width, height = dimensions
+    temp_paths: list[Path] = []
+    capture_started_at = now_ms()
+    encoder = "scrot-imlib2"
+    fallback_used = False
+    source_path: Path | None = None
+    committed = False
+    try:
+        scrot_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.scrot.webp")
+        temp_paths.append(scrot_path)
+        if capture_with_scrot(scrot_path):
+            try:
+                validate_webp(scrot_path, dimensions)
+                source_path = scrot_path
+            except ScreenshotCaptureError:
+                pass
+
+        if source_path is None:
+            if scrot_path.exists():
+                scrot_path.unlink(missing_ok=True)
+            fallback_used = True
+            encoder = "ffmpeg-libwebp"
+            ffmpeg_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.ffmpeg.webp")
+            temp_paths.append(ffmpeg_path)
+            if not capture_with_ffmpeg(ffmpeg_path, width, height):
+                raise ScreenshotCaptureError("direct WebP capture is unavailable from scrot and ffmpeg")
+            validate_webp(ffmpeg_path, dimensions)
+            source_path = ffmpeg_path
+        capture_ms = max(0, now_ms() - capture_started_at)
+
+        encode_started_at = now_ms()
+        encoding_mode = "lossless"
+        selected_path = source_path
+        size = selected_path.stat().st_size
+        if size > MAX_SCREENSHOT_BYTES:
+            for quality, mode in ((88, "q88"), (80, "q80")):
+                encoded_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.{mode}.webp")
+                temp_paths.append(encoded_path)
+                if not transcode_webp(selected_path, encoded_path, quality):
+                    continue
+                validate_webp(encoded_path, dimensions)
+                selected_path = encoded_path
+                size = encoded_path.stat().st_size
+                encoding_mode = mode
+                if size <= MAX_SCREENSHOT_BYTES:
+                    break
+            if size > MAX_SCREENSHOT_BYTES:
+                raise ScreenshotCaptureError(
+                    f"screenshot WebP exceeds the {MAX_SCREENSHOT_BYTES} byte model image limit after q80 encoding"
+                )
+        encode_ms = max(0, now_ms() - encode_started_at)
+        os.replace(selected_path, target)
+        metadata = {
+            "mimeType": WEBP_MIME_TYPE,
+            "extension": ".webp",
+            "width": width,
+            "height": height,
+            "encodedBytes": size,
+            "encodingMode": encoding_mode,
+        }
+        atomic_write_json(screenshot_metadata_path(target), metadata)
+        committed = True
+    except ScreenshotCaptureError:
+        if not committed:
+            target.unlink(missing_ok=True)
+            screenshot_metadata_path(target).unlink(missing_ok=True)
+        raise
+    except (OSError, subprocess.TimeoutExpired) as err:
+        if not committed:
+            target.unlink(missing_ok=True)
+            screenshot_metadata_path(target).unlink(missing_ok=True)
+        raise ScreenshotCaptureError("screenshot capture or encoding failed") from err
+    finally:
+        for temp_path in temp_paths:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+    log_event(
+        "desktop.screenshot",
+        {
+            "action": action_id,
+            "purpose": purpose,
+            "outcome": "success",
+            "capture_mode": "full_display",
+            "display": DISPLAY_VALUE,
+            "bytes": size,
+            "encoded_bytes": size,
+            "encoding_mode": encoding_mode,
+            "mime_type": WEBP_MIME_TYPE,
+            "width": width,
+            "height": height,
+            "encoder": encoder,
+            "fallback_used": fallback_used,
+            "capture_ms": capture_ms,
+            "encode_ms": encode_ms,
+            "duration_ms": capture_ms + encode_ms,
+        },
+    )
+    return {
+        "path": str(target),
+        "width": width,
+        "height": height,
+        "bytes": size,
+        "encodedBytes": size,
+        "extension": ".webp",
+        "mimeType": WEBP_MIME_TYPE,
+        "encodingMode": encoding_mode,
+        "encoder": encoder,
+        "fallbackUsed": fallback_used,
+        "purpose": purpose,
+        "captureMode": "full_display",
+        "displayName": DISPLAY_VALUE,
+        "_captureMs": capture_ms,
+        "_encodeMs": encode_ms,
+    }
+
+
+def recent_screenshots(scenario_id: str, current_path: str | None) -> list[dict[str, Any]]:
+    try:
+        paths = sorted(
+            (path for path in scenario_dir(scenario_id).iterdir() if path.suffix.lower() in SCREENSHOT_EXTENSIONS),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    recent: list[dict[str, Any]] = []
+    for path in paths:
+        if current_path and str(path.resolve()) == current_path:
+            continue
+        name_parts = path.stem.split("-")
+        action_id = "-".join(name_parts[1:-1]) if len(name_parts) >= 3 else path.stem
+        purpose = name_parts[-1] if name_parts and name_parts[-1] in {"action_feedback", "observe", "proof_candidate"} else "observe"
+        try:
+            captured_at_ms = int(path.stat().st_mtime * 1000)
+        except OSError:
+            continue
+        recent.append(
+            {
+                "actionId": action_id,
+                "path": str(path.resolve()),
+                "capturedAtMs": captured_at_ms,
+                "purpose": purpose,
+            },
+        )
+        if len(recent) >= 3:
+            break
+    return recent
+
+
+def populate_read_metadata(result: dict[str, Any], health: dict[str, Any] | None) -> None:
+    display = display_from_health(health)
+    dimensions = query_display_size()
+    if dimensions is not None:
+        display = {"width": dimensions[0], "height": dimensions[1], "scale": 1}
+    windows = query_windows()
+    result["display"] = display
+    result["windows"] = windows
+    result["activeWindow"] = query_active_window(windows)
+    result["pointer"] = query_pointer()
+
+
+def run_health_command(action: str, action_id: str, started_at_ms: int) -> tuple[dict[str, Any], int]:
+    health, readiness = ensure_desktop_available()
+    if action == "health" and desktop_is_available(health):
+        health = refresh_supervisor_health_if_available() or health
+        health_check_mode = health.get("healthCheckMode") if isinstance(health, dict) else None
+        readiness["healthCheckMode"] = health_check_mode if isinstance(health_check_mode, str) else None
+    result = empty_result(action, action_id, started_at_ms)
+    set_desktop_readiness(result, readiness)
+    result["display"] = display_from_health(health)
+    result["health"] = health
+    if desktop_is_available(health):
+        result["ok"] = True
+        return finish(result), 0
+    result["error"] = unavailable_error(health)
+    return finish(result), 1
+
+
+def run_windows_command(action: str, action_id: str, started_at_ms: int) -> tuple[dict[str, Any], int]:
+    health, readiness = ensure_desktop_available()
+    result = empty_result(action, action_id, started_at_ms)
+    set_desktop_readiness(result, readiness)
+    result["display"] = display_from_health(health)
+    if not desktop_is_available(health):
+        result["error"] = unavailable_error(health)
+        return finish(result), 1
+    metadata_started_at = now_ms()
+    populate_read_metadata(result, health)
+    record_stage_timing(result, "metadataMs", metadata_started_at)
+    result["ok"] = True
+    return finish(result), 0
+
+
+def run_capture_command(
+    action: str,
+    action_id: str,
+    started_at_ms: int,
+    scenario_id: str,
+    purpose: str,
+) -> tuple[dict[str, Any], int]:
+    health, readiness = ensure_desktop_available()
+    result = empty_result(action, action_id, started_at_ms)
+    set_desktop_readiness(result, readiness)
+    result["display"] = display_from_health(health)
+    if not desktop_is_available(health):
+        result["error"] = unavailable_error(health)
+        log_event("desktop.screenshot", {"action": action_id, "purpose": purpose, "outcome": "desktop_unavailable"})
+        return finish(result), 1
+
+    metadata_started_at = now_ms()
+    populate_read_metadata(result, health)
+    record_stage_timing(result, "metadataMs", metadata_started_at)
+    quota_ok, quota_message = quota_allows_capture()
+    if not quota_ok:
+        result["error"] = {"code": "screenshot_quota_exceeded", "message": quota_message, "retryable": False}
+        log_event("desktop.screenshot", {"action": action_id, "purpose": purpose, "outcome": "quota_exceeded"})
+        return finish(result), 1
+
+    screenshot_started_at = now_ms()
+    try:
+        screenshot = capture_screenshot(action_id, scenario_id, purpose)
+    except ValueError as err:
+        record_stage_timing(result, "screenshotCaptureMs", screenshot_started_at)
+        result["error"] = {"code": "path_containment_failed", "message": str(err), "retryable": False}
+        log_event("desktop.screenshot", {"action": action_id, "purpose": purpose, "outcome": "path_containment_failed"})
+        return finish(result), 1
+    except (ScreenshotCaptureError, RuntimeError, TimeoutError) as err:
+        record_stage_timing(result, "screenshotCaptureMs", screenshot_started_at)
+        result["error"] = structured_error(
+            "screenshot_capture_failed",
+            str(err),
+            retryable=True,
+            safe_to_retry=True,
+            recommended_next_tool="desktop.screenshot",
+        )
+        log_event(
+            "desktop.screenshot",
+            {"action": action_id, "purpose": purpose, "outcome": "screenshot_capture_failed"},
+        )
+        return finish(result), 1
+
+    record_screenshot_timings(result, screenshot, screenshot_started_at)
+    if purpose == "proof_candidate":
+        try:
+            screenshot["evidencePath"] = stage_runtime_evidence(
+                Path(screenshot["path"]),
+                f"desktop-{scenario_id}-proof-{time.time_ns()}.webp",
+            )
+            log_event(
+                "desktop.evidence_staged",
+                {"artifact_type": "screenshot", "scenario_id": scenario_id, "bytes": screenshot["bytes"]},
+            )
+        except (OSError, ValueError) as err:
+            result["screenshot"] = screenshot
+            result["error"] = {
+                "code": "evidence_stage_failed",
+                "message": f"proof screenshot was captured but could not be staged for publication: {err}",
+                "retryable": True,
+            }
+            log_event(
+                "desktop.screenshot",
+                {"action": action_id, "purpose": purpose, "outcome": "evidence_stage_failed"},
+            )
+            return finish(result), 1
+
+    result["ok"] = True
+    result["screenshot"] = screenshot
+    result["recentScreenshots"] = recent_screenshots(scenario_id, screenshot["path"])
+    result["display"] = {
+        "width": screenshot["width"] or result["display"]["width"],
+        "height": screenshot["height"] or result["display"]["height"],
+        "scale": 1,
+    }
+    return finish(result), 0
+
+
+def main(argv: list[str]) -> int:
+    global CURRENT_BRIDGE_BUNDLE_SHA256
+    command, options, parse_error = parse_args(argv)
+    supplied_bridge_sha256 = options.get("bridge-bundle-sha256")
+    if isinstance(supplied_bridge_sha256, str) and supplied_bridge_sha256:
+        CURRENT_BRIDGE_BUNDLE_SHA256 = supplied_bridge_sha256
+    started_at_ms = now_ms()
+    action = command or "unknown"
+    action_id = str(options.get("action-id") or f"{action}-{uuid.uuid4().hex[:12]}")
+    if parse_error is not None:
+        result = empty_result(action, action_id, started_at_ms)
+        result["error"] = {"code": "invalid_request", "message": parse_error, "retryable": False}
+        return emit_json(finish(result), 2)
+
+    supplied_protocol_version = options.get("desktop-protocol-version")
+    if isinstance(supplied_protocol_version, str) and supplied_protocol_version != DESKTOP_PROTOCOL_VERSION:
+        result = empty_result(action, action_id, started_at_ms)
+        result["error"] = structured_error(
+            "desktop_protocol_mismatch",
+            f"desktop protocol mismatch: bridge requested {supplied_protocol_version}; CLI provides {DESKTOP_PROTOCOL_VERSION}",
+            retryable=False,
+            safe_to_retry=False,
+            recommended_next_tool=None,
+        )
+        log_event(
+            "desktop.protocol_mismatch",
+            {"expected_version": DESKTOP_PROTOCOL_VERSION, "actual_version": supplied_protocol_version},
+        )
+        return emit_json(finish(result), 1)
+
+    if command not in {"observe", "screenshot", "windows", "health", "status", "preflight"} | MUTATING_COMMANDS | RECORDING_COMMANDS:
+        result = empty_result(action, action_id, started_at_ms)
+        result["error"] = {"code": "invalid_request", "message": f"unknown command: {command}", "retryable": False}
+        return emit_json(finish(result), 2)
+
+    if command == "preflight":
+        result, exit_code = run_preflight_command(command, action_id, started_at_ms)
+        return emit_json(result, exit_code)
+
+    if command in {"health", "status"}:
+        result, exit_code = run_health_command(command, action_id, started_at_ms)
+        return emit_json(result, exit_code)
+
+    if command == "windows":
+        result, exit_code = run_windows_command(command, action_id, started_at_ms)
+        return emit_json(result, exit_code)
+
+    if command == "record_status":
+        result, exit_code = run_record_status(command, action_id, started_at_ms, options)
+        return emit_json(result, exit_code)
+
+    raw_scenario_id = str(options.get("scenario-id") or os.environ.get("ARCANIST_DESKTOP_SCENARIO_ID") or "default")
+    scenario_id = validate_scenario_id(raw_scenario_id)
+    if scenario_id is None:
+        result = empty_result(command, action_id, started_at_ms)
+        result["error"] = {
+            "code": "path_containment_failed",
+            "message": "scenario id must be a simple identifier",
+            "retryable": False,
+        }
+        return emit_json(finish(result), 2)
+
+    if command == "record_start":
+        result, exit_code = run_record_start(command, action_id, started_at_ms, options, scenario_id)
+        return emit_json(result, exit_code)
+
+    if command == "record_stop":
+        result, exit_code = run_record_stop(command, action_id, started_at_ms, options)
+        return emit_json(result, exit_code)
+
+    if command in MUTATING_COMMANDS:
+        result, exit_code = run_mutating_command(command, action_id, started_at_ms, options, scenario_id)
+        return emit_json(result, exit_code)
+
+    raw_purpose = str(options.get("purpose") or ("proof_candidate" if command == "screenshot" else "observe"))
+    if raw_purpose not in {"observe", "proof_candidate"}:
+        result = empty_result(command, action_id, started_at_ms)
+        result["error"] = {"code": "invalid_request", "message": "invalid screenshot purpose", "retryable": False}
+        return emit_json(finish(result), 2)
+
+    result, exit_code = run_capture_command(command, action_id, started_at_ms, scenario_id, raw_purpose)
+    return emit_json(result, exit_code)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except Exception as err:
+        started = now_ms()
+        action_id = f"error-{uuid.uuid4().hex[:12]}"
+        result = empty_result("unknown", action_id, started)
+        result["error"] = {"code": "internal_error", "message": str(err), "retryable": True}
+        raise SystemExit(emit_json(finish(result), 1))

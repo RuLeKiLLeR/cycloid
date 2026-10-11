@@ -1,0 +1,37 @@
+name: Deploy Control Plane Worker (QA)
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy to QA
+        required: true
+        default: main
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  id-token: write
+  statuses: read
+jobs:
+  deploy:
+    name: Deploy QA
+    uses: ./.github/workflows/deploy-control-plane-core.yml
+    permissions:
+      contents: read
+      id-token: write
+      statuses: read
+    with:
+      ref: ${{ inputs.ref }}
+      environment: qa
+      force_deploy: false
+      sync_secrets: true
+      wait_for_tfc: false
+      notify_slack: ${{ inputs.notify_slack }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

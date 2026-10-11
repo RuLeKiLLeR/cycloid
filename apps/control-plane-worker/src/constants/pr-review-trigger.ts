@@ -1,0 +1,10 @@
+export const PR_REVIEW_TRIGGER_CLAIM_STALE_AFTER_MS = 30 * 60 * 1000;
+export const CYCLOID_REVIEW_TRIGGER_TOKEN = "@cycloid-review";
+export const CYCLOID_REVIEW_COMMENT_MARKER = "<!-- cycloid-review -->";
+export const PR_REVIEW_MAX_FINDINGS = 40;
+export const PR_REVIEW_MAX_MARKDOWN_CHARS = 60_000;
+export const PR_REVIEW_MAX_FINDING_BODY_CHARS = 8_000;
+export const PR_REVIEW_MAX_SUGGESTION_CHARS = 4_000;
+export const PR_REVIEW_MAX_CITATIONS = 5;
+export const PR_REVIEW_MAX_CITATION_CHARS = 240;
+export const PR_REVIEW_MAX_INLINE_BODY_CHARS = 200_000;

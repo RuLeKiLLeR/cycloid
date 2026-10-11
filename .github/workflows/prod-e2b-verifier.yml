@@ -1,0 +1,303 @@
+name: Prod PR Smoke Test
+
+on:
+  workflow_run:
+    # Names must match the upstream deploy workflows' `name:` fields exactly. A
+    # rename there silently stops this trigger; the workflow guard test pins the
+    # two in sync. `branches` and the job `if:` event filter below admit only
+    # real prod deploys (push/dispatch on main), not validate-only PR runs.
+    workflows: ["Deploy Control Plane Worker", "Deploy E2B Sandbox", "QA-Gated Production Deploy"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    # Sparse liveness heartbeat (every 3h) - NOT a smoke run. Deploy completions
+    # trigger the actual smoke via workflow_run above; these schedule ticks only
+    # keep a recent run on record so prod-e2b-verifier-deadman.yml does not
+    # false-alarm on quiet nights. The expensive smoke steps are gated off for
+    # schedule events (see the job steps), so an idle night costs nothing beyond
+    # these cheap ticks.
+    - cron: "13 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: Send a Slack test alert without running the smoke test
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read # cooldown gate reads this workflow's own runs/artifacts
+
+concurrency:
+  group: prod-e2b-verifier
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify prod PR smoke test
+    # Deploy-triggered (workflow_run) runs must only fire after a real successful
+    # prod deploy, not the validate-only pull_request runs of the same upstream
+    # workflow: deploy-control-plane.yml runs on both pull_request and push, so
+    # the event filter is load-bearing. schedule/dispatch events always run.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       (github.event.workflow_run.event == 'push' ||
+        github.event.workflow_run.event == 'workflow_dispatch'))
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      BASE_URL: https://app.trycycloid.com
+      REPORT_PATH: artifacts/prod-pr-smoke-${{ github.run_id }}.json
+      RUN_KIND: >-
+        ${{ github.event_name == 'workflow_dispatch' && 'manual production smoke'
+        || github.event_name == 'workflow_run' && format('deploy-triggered production smoke (after {0})', github.event.workflow_run.name)
+        || 'scheduled liveness heartbeat (no smoke)' }}
+      UPSTREAM_RUN_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
+    steps:
+      - name: Determine deploy smoke eligibility
+        id: deploy_surface
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          UPSTREAM_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ "$UPSTREAM_WORKFLOW_NAME" != "QA-Gated Production Deploy" ]; then
+            echo "run_smoke=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          jobs_json="$(gh api "/repos/${REPO}/actions/runs/${UPSTREAM_RUN_ID}/jobs?per_page=100")"
+          if jq -e '
+            [.jobs[]
+              | select(
+                  (
+                    .name == "Prod Control Plane"
+                    or (.name | startswith("Prod Control Plane / "))
+                    or .name == "Prod E2B Sandbox"
+                    or (.name | startswith("Prod E2B Sandbox / "))
+                    or .name == "Prod E2B Sandbox Registration"
+                    or (.name | startswith("Prod E2B Sandbox Registration / "))
+                  )
+                  and .conclusion == "success"
+                )]
+            | length > 0
+          ' >/dev/null <<< "$jobs_json"; then
+            echo "run_smoke=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "QA-gated deploy did not deploy production control-plane or E2B; skipping prod PR smoke."
+            echo "run_smoke=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cooldown gate
+        id: cooldown
+        # Only deploy-triggered (workflow_run) runs are subject to cooldown.
+        # Manual dispatch always runs the smoke (an operator forcing a run wants
+        # it now); schedule never runs the smoke at all. So we only compute a
+        # cooldown decision for workflow_run events; every other event leaves
+        # steps.cooldown.outputs.skip unset, which the smoke gate reads as "run".
+        if: ${{ github.event_name == 'workflow_run' && steps.deploy_surface.outputs.run_smoke != 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          COOLDOWN_SECONDS: "1800" # 30 min: coalesce a burst of deploys to one smoke
+        run: |
+          set -euo pipefail
+
+          api() {
+            # Retry transient GitHub API failures (5xx/network) a few times. A
+            # persistent failure still exits non-zero (set -e) and surfaces via
+            # the failure Slack step - we never silently skip or silently run when
+            # cooldown state cannot be proven.
+            local path="$1" attempt
+            for attempt in 1 2 3; do
+              if gh api "$path"; then return 0; fi
+              sleep $(( attempt * 3 ))
+            done
+            echo "::error::cooldown gate could not query GitHub API: $path"
+            return 1
+          }
+
+          NOW_EPOCH="$(date -u +%s)"
+
+          # Newest non-expired smoke artifact across the repo, excluding the
+          # current run. Verifier artifacts are named prod-pr-smoke-<run_id>
+          # and are uploaded for every ATTEMPTED smoke - a marker file is written
+          # at smoke start so a failed smoke (which never writes its report) still
+          # leaves an artifact and counts here. created_at is the upload time
+          # (~smoke completion), so the window is measured from completion.
+          LAST_TS="$(api "/repos/${REPO}/actions/artifacts?per_page=100" \
+            | jq -r --arg cur "$CURRENT_RUN_ID" '
+                [ .artifacts[]
+                  | select(.expired == false)
+                  | select(.name | startswith("prod-pr-smoke-"))
+                  | select((.workflow_run.id | tostring) != $cur)
+                  | .created_at ]
+                | max // empty')"
+
+          SKIP=false
+          if [ -n "$LAST_TS" ]; then
+            LAST_EPOCH="$(date -u -d "$LAST_TS" +%s)"
+            AGE=$(( NOW_EPOCH - LAST_EPOCH ))
+            if [ "$AGE" -lt "$COOLDOWN_SECONDS" ]; then
+              SKIP=true
+              echo "Last smoke attempt ${AGE}s ago (< ${COOLDOWN_SECONDS}s) - skipping smoke this run."
+            else
+              echo "Last smoke attempt ${AGE}s ago (>= ${COOLDOWN_SECONDS}s) - running smoke."
+            fi
+          else
+            echo "No recent smoke artifact found - running smoke."
+          fi
+          echo "skip=${SKIP}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: ${{ (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && !inputs.test_alert)) && steps.deploy_surface.outputs.run_smoke != 'false' && steps.cooldown.outputs.skip != 'true' }}
+
+      - name: Verify token secret is configured
+        if: ${{ (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && !inputs.test_alert)) && steps.deploy_surface.outputs.run_smoke != 'false' && steps.cooldown.outputs.skip != 'true' }}
+        env:
+          ARCANIST_TOKEN: ${{ secrets.ARCANIST_PROD_VERIFIER_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ARCANIST_TOKEN}" ]; then
+            echo "::error::ARCANIST_PROD_VERIFIER_TOKEN is not configured"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v6
+        if: ${{ (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && !inputs.test_alert)) && steps.deploy_surface.outputs.run_smoke != 'false' && steps.cooldown.outputs.skip != 'true' }}
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        if: ${{ (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && !inputs.test_alert)) && steps.deploy_surface.outputs.run_smoke != 'false' && steps.cooldown.outputs.skip != 'true' }}
+        run: HUSKY=0 npm ci --no-audit --no-fund
+
+      - name: Run prod PR smoke test
+        if: ${{ (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && !inputs.test_alert)) && steps.deploy_surface.outputs.run_smoke != 'false' && steps.cooldown.outputs.skip != 'true' }}
+        env:
+          ARCANIST_TOKEN: ${{ secrets.ARCANIST_PROD_VERIFIER_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$REPORT_PATH")"
+          # Attempt marker: written BEFORE the smoke runs so a failed smoke (which
+          # exits before writing its report) still leaves a prod-pr-smoke-*
+          # artifact. The cooldown gate keys off artifact presence == "a smoke was
+          # attempted", so a failing smoke still trips the cooldown and does not
+          # retry-storm on the next deploy.
+          printf '{"attempt":true,"runId":"%s"}\n' "${GITHUB_RUN_ID}" > "${REPORT_PATH%.json}-attempt.json"
+          LOG_PATH="${REPORT_PATH%.json}.log"
+          set +e
+          npx tsx scripts/verify-e2b-session.ts \
+            --base-url "$BASE_URL" \
+            --json-out "$REPORT_PATH" 2>&1 | tee "$LOG_PATH"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            REASON="$(grep -v '^[[:space:]]*$' "$LOG_PATH" | tail -n 1)"
+            {
+              echo "FAILURE_REASON<<EOF"
+              echo "${REASON:-Verifier exited with status ${STATUS}}"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            exit "$STATUS"
+          fi
+
+      - name: Upload verifier report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prod-pr-smoke-${{ github.run_id }}
+          path: artifacts/prod-pr-smoke-*.json
+          if-no-files-found: ignore
+
+      - name: Notify Slack on success
+        if: ${{ success() && (github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && !inputs.test_alert)) && steps.deploy_surface.outputs.run_smoke != 'false' && steps.cooldown.outputs.skip != 'true' }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.event_name != 'schedule' && github.actor || '' }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BASE_URL: ${{ env.BASE_URL }}
+          REPORT_PATH: ${{ env.REPORT_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          SHORT_SHA="${SHA::7}"
+          UPSTREAM_LINE=""
+          if [ -n "${UPSTREAM_RUN_URL:-}" ]; then
+            UPSTREAM_LINE="
+          Upstream deploy run: <${UPSTREAM_RUN_URL}|view>"
+          fi
+          PAYLOAD=$(jq -n \
+            --arg text ":white_check_mark: *Prod PR smoke test passed*
+          What ran: ${RUN_KIND} created and verified a PR in \`jeman-verification/verification-prod\`.
+          <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> by ${ACTOR} against ${BASE_URL} | <${RUN_URL}|View run>${UPSTREAM_LINE}
+          Report artifact path: \`${REPORT_PATH}\`" \
+            '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"
+
+      - name: Notify Slack test alert
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.event_name != 'schedule' && github.actor || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BASE_URL: ${{ env.BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          PAYLOAD=$(jq -n \
+            --arg text ":large_blue_circle: *Test alert: Prod PR smoke test notification*
+          This is a manual test alert from ${ACTOR}; no smoke session was run.
+          Target: ${BASE_URL} | <${RUN_URL}|View run>" \
+            '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"
+
+      - name: Notify Slack on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.event_name != 'schedule' && github.actor || '' }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BASE_URL: ${{ env.BASE_URL }}
+          REPORT_PATH: ${{ env.REPORT_PATH }}
+          FAILURE_REASON: ${{ env.FAILURE_REASON }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          SHORT_SHA="${SHA::7}"
+          UPSTREAM_LINE=""
+          if [ -n "${UPSTREAM_RUN_URL:-}" ]; then
+            UPSTREAM_LINE="
+          Upstream deploy run: <${UPSTREAM_RUN_URL}|view>"
+          fi
+          MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          REASON="${FAILURE_REASON:-GitHub Actions failed before the verifier reported a reason.}"
+          PAYLOAD=$(jq -n \
+            --arg text ":x: *Prod PR smoke test failed*
+          What failed: ${RUN_KIND} did not create a PR in \`jeman-verification/verification-prod\`.
+          Why: ${REASON}
+          <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> by ${ACTOR} against ${BASE_URL} | <${RUN_URL}|View run>${MENTION}${UPSTREAM_LINE}
+          Report artifact path: \`${REPORT_PATH}\`" \
+            '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"

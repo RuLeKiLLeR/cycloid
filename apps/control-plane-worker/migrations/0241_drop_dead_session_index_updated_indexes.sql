@@ -1,0 +1,12 @@
+-- Drop the superseded session_index business updated_at index.
+--
+-- idx_session_index_business_updated is replaced for session listing by
+-- idx_session_index_business_created and for active-cap counting by
+-- idx_session_index_business_status.
+--
+-- Keep idx_session_index_owner_updated: observability session search still
+-- filters by owner_user_id and orders by updated_at.
+--
+-- Keep idx_session_index_status_updated: cleanup/reconciler paths still filter
+-- status = 'active' and range/order by updated_at.
+DROP INDEX IF EXISTS idx_session_index_business_updated;

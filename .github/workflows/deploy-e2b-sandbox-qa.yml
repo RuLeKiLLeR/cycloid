@@ -1,0 +1,38 @@
+name: Deploy E2B Sandbox (QA)
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to build into a QA E2B template
+        required: true
+        default: main
+      skip_cache:
+        description: Force a from-scratch rebuild (bypass E2B layer cache) - debug only
+        required: false
+        type: boolean
+        default: false
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  deploy:
+    name: Deploy QA
+    uses: ./.github/workflows/deploy-e2b-sandbox-core.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      ref: ${{ inputs.ref }}
+      environment: qa
+      skip_cache: ${{ inputs.skip_cache }}
+      notify_slack: ${{ inputs.notify_slack }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

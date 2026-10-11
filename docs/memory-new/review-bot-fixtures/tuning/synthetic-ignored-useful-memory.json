@@ -1,0 +1,56 @@
+{
+  "schema_version": "memory_review_bot_fixture_v1",
+  "fixture_id": "synthetic-ignored-useful-memory",
+  "fixture_source": "synthetic",
+  "prompt": {
+    "session_id": "synthetic-session-ignored-memory",
+    "prompt_id": "synthetic-prompt-ignored-memory",
+    "task_summary": "A relevant memory was returned, but the agent ignored it and produced an incomplete fix.",
+    "bounded_prompt": "Update the review delivery path so Slack failures retry independently after D1 review persistence succeeds.",
+    "outcome_summary": "The memory was relevant and useful, but the output only changed D1 writes and omitted independent Slack retry handling."
+  },
+  "returned_memories": [
+    {
+      "memory_id": "mem-review-delivery-retry",
+      "source": "synthetic",
+      "rank": 1,
+      "score": 0.94,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Memory review delivery failures must retry independently after the completed review is persisted, without duplicating the review."
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "ev_prompt_delivery_retry",
+      "kind": "prompt",
+      "snippet": "The task explicitly required Slack failures to retry independently after successful D1 review persistence."
+    },
+    {
+      "evidence_id": "ev_memory_delivery_retry",
+      "kind": "memory",
+      "snippet": "The returned memory directly states that delivery failures must retry independently and avoid duplicated completed reviews."
+    },
+    {
+      "evidence_id": "ev_output_ignored_retry",
+      "kind": "output",
+      "snippet": "The output changed only the review persistence path and did not add or mention retry behavior for Slack delivery failures."
+    }
+  ],
+  "expected": {
+    "prompt_outcome": "false_negative",
+    "evidence_ids": ["ev_prompt_delivery_retry", "ev_memory_delivery_retry", "ev_output_ignored_retry"],
+    "memory_results": [
+      {
+        "memory_id": "mem-review-delivery-retry",
+        "relevance": "relevant",
+        "usefulness": "useful",
+        "effect": "neutral",
+        "lifecycle_state": "active",
+        "root_causes": ["agent_usage"],
+        "evidence_ids": ["ev_prompt_delivery_retry", "ev_memory_delivery_retry", "ev_output_ignored_retry"],
+        "rationale": "The memory was directly useful, but the output did not apply it."
+      }
+    ]
+  }
+}

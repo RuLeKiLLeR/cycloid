@@ -1,0 +1,21 @@
+{
+  "phase": "timeline",
+  "timestampMs": 1760000000600,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "eventType": "files.edited",
+    "source": "observed",
+    "observer": "sandbox_bridge",
+    "summary": "Edited the wrangler parity test.",
+    "status": "completed",
+    "metadata": {
+      "files": ["tests/test_cloudflare/wrangler-public-vars.test.ts"]
+    },
+    "bridgeEventType": "agent_timeline",
+    "bridgeData": {
+      "id": "timeline-1"
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@cycloid/sandbox-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "bundle": "npm run bundle:main",
+    "bundle:main": "esbuild src/index.ts --bundle --platform=node --target=node22 --outfile=dist/bundle.js --format=esm --external:sharp --external:@anthropic-ai/claude-agent-sdk --external:@opencode-ai/sdk --banner:js=\"import{createRequire as __createRequire}from'module';const require=__createRequire(import.meta.url);\"",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.170",
+    "@opencode-ai/sdk": "1.17.11",
+    "@opentelemetry/core": "^2.9.0",
+    "@opentelemetry/instrumentation": "^0.214.0",
+    "@opentelemetry/resources": "^2.9.0",
+    "@opentelemetry/sdk-trace-base": "^2.9.0",
+    "@sentry/node": "^10.65.0",
+    "braintrust": "^3.17.0",
+    "sharp": "^0.34.5",
+    "undici": "^7.25.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.12",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.9.3"
+  }
+}

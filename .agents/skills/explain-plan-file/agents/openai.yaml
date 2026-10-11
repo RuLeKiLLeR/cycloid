@@ -1,0 +1,4 @@
+interface:
+  display_name: "Explain Plan File"
+  short_description: "Explain plan files clearly"
+  default_prompt: "Use $explain-plan-file with the path to a plan file to explain the plan for a new grad engineer, including PR context when the file embeds or clearly references a PR."

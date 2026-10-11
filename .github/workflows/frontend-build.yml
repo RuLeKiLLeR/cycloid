@@ -1,0 +1,112 @@
+name: Frontend Build
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      # Detect UI-relevant changes via the PR files API instead of a local
+      # `git diff`, so the job no longer needs a full-history checkout
+      # (`fetch-depth: 0`). The `build` job still runs on every PR and reports
+      # the required `build` check; only the expensive install/build/test steps
+      # are gated behind ui_changed.
+      - name: Detect UI-relevant changes
+        id: changes
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.map((file) => file.filename);
+            core.info(`Changed files:\n${changedFiles.join("\n")}`);
+
+            // Fail closed if GitHub truncated the file list: when the reported
+            // count exceeds what we retrieved, run the UI build rather than
+            // risk skipping a relevant change we never saw.
+            const reportedChangedFiles = context.payload.pull_request.changed_files;
+            const fileListTruncated =
+              Number.isInteger(reportedChangedFiles) &&
+              reportedChangedFiles > changedFiles.length;
+            if (fileListTruncated) {
+              core.warning(
+                `PR reports ${reportedChangedFiles} changed files but only ${changedFiles.length} were retrieved; running UI build fail-closed.`,
+              );
+            }
+
+            // UI relevance: apps/ui, apps/control-plane-worker (for contract
+            // tests reading ws/types.ts, plus the request.json() cast metric the
+            // frontend audit scans), shared/ (UI tests import helpers),
+            // scripts/frontend-audit (the auditor) and its test, tests/test_ui,
+            // lockfiles, any vitest config, root tsconfig (affects TS resolution
+            // for UI tests), and this workflow. The frontend audit scans
+            // apps/ui/** and apps/control-plane-worker/src/** from the
+            // filesystem, so it has no import edge for vitest --changed; it must
+            // be force-run here (the workflow that already triggers on those
+            // paths) rather than left to the backend-tests post-merge backstop.
+            // Fail closed: any unclassified change under apps/ui/ or
+            // tests/test_ui/ already matches via the generic prefixes.
+            const uiPattern =
+              /^(apps\/ui\/|apps\/control-plane-worker\/|shared\/|scripts\/frontend-audit\/|tests\/test_ui\/|tests\/test_scripts\/frontend-audit\.test\.ts$|tests\/test_agent\/frontend-build-workflow\.test\.ts$|package\.json$|package-lock\.json$|vitest(\..+)?\.config\.ts$|tsconfig\.json$|\.github\/workflows\/frontend-build\.yml$)/;
+            const uiChanged =
+              fileListTruncated || changedFiles.some((file) => uiPattern.test(file));
+
+            core.setOutput("ui_changed", String(uiChanged));
+
+      - uses: actions/checkout@v7
+        if: steps.changes.outputs.ui_changed == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-node@v6
+        if: steps.changes.outputs.ui_changed == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Cache node_modules
+        if: steps.changes.outputs.ui_changed == 'true'
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+
+      - name: Install dependencies
+        if: steps.changes.outputs.ui_changed == 'true' && steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Build UI
+        if: steps.changes.outputs.ui_changed == 'true'
+        run: npm run build:ui
+
+      - name: Run unauthenticated exposure static checks
+        if: steps.changes.outputs.ui_changed == 'true'
+        run: npm run security:unauth-exposure -- --dist dist/ui --strict-assets
+
+      - name: Run UI tests and frontend architecture audit
+        if: steps.changes.outputs.ui_changed == 'true'
+        run: npx vitest run tests/test_ui tests/test_scripts/frontend-audit.test.ts tests/test_agent/frontend-build-workflow.test.ts --maxWorkers=4
+
+      - name: Skip UI tests when irrelevant
+        if: steps.changes.outputs.ui_changed != 'true'
+        run: echo "No UI-relevant changes detected; UI tests skipped."

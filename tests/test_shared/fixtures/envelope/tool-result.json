@@ -1,0 +1,20 @@
+{
+  "phase": "tool.result",
+  "timestampMs": 1760000000500,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "callId": "tool-1",
+    "tool": "exec_command",
+    "ok": true,
+    "result": {
+      "exitCode": 0
+    },
+    "bridgeEventType": "tool_update",
+    "bridgeData": {
+      "status": "completed",
+      "output": "1 passed"
+    }
+  }
+}

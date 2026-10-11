@@ -1,0 +1,16 @@
+{
+  "phase": "pr.open",
+  "timestampMs": 1760000000900,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "success": true,
+    "prUrl": "https://github.com/trycycloid/cycloid/pull/123",
+    "prNumber": 123,
+    "bridgeEventType": "pr_opened",
+    "bridgeData": {
+      "branch": "close-testing-gaps"
+    }
+  }
+}

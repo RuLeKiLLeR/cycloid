@@ -1,0 +1,14 @@
+- Create a copied customer repo and preserve the initial import commit.
+- Audit how the app starts locally: web, API, database, cache, migrations, seed data, and auth.
+- Add `.cycloid.json` with Docker runtime, web URL, API ports, readiness timeout, auth command, and path-scoped `verify.test.rules`.
+- Add `.cycloid/docker-compose.yml` using existing product Dockerfiles where possible.
+- Add `.cycloid/scripts/auth.*` to log in with a seeded non-2FA user and write browser storage state.
+- Add startup/typecheck/proxy scripts only when Cycloid needs them.
+- Add local-only shims only for cloud dependencies that block sandbox startup.
+- Add `.dockerignore` fixes if local artifacts pollute Docker builds.
+- Measure cold boot, auth, setup, and verify speed; set timeouts from observed runs.
+- In Cycloid, add missing sandbox tools/resources before asking agents to run repo commands.
+- In Cycloid, map repo paths into UI, backend, data, infra, test, docs, and dependency buckets.
+- In Cycloid, accept the repo's real proof commands as verification evidence.
+- In Cycloid, support repo setup scripts and hooks without exposing Cycloid secrets.
+- Add tests for every new path bucket, proof command, setup behavior, and sandbox tool.

@@ -1,0 +1,118 @@
+name: Typecheck
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Single job: one checkout + one `npm ci` (the dominant cost), then run all
+  # seven typecheck targets sequentially. Each result is captured so the job
+  # reports every failure (preserving the old matrix `fail-fast: false`
+  # behavior) and exits non-zero if any failed. Runs on ARM to stay off the
+  # pricier x86 bucket the old aggregator used.
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Detect typecheck-relevant changes
+        id: changes
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.flatMap((file) =>
+              [file.filename, file.previous_filename].filter(Boolean),
+            );
+            core.info(`Changed files:\n${changedFiles.join("\n")}`);
+
+            const reportedChangedFiles = context.payload.pull_request.changed_files;
+            const fileListTruncated =
+              Number.isInteger(reportedChangedFiles) &&
+              reportedChangedFiles > files.length;
+            if (fileListTruncated) {
+              core.warning(
+                `PR reports ${reportedChangedFiles} changed files but only ${files.length} were retrieved; running typecheck fail-closed.`,
+              );
+            }
+
+            const typecheckPattern =
+              /^(\.github\/workflows\/|apps\/.*\.(ts|tsx)$|tools\/.*\.(ts|tsx)$|shared\/.*\.(ts|tsx)$|scripts\/.*\.(ts|tsx|mts|cts|js|mjs|cjs)$|tests\/(?!(test_sandbox-bridge|test_cloudflare|test_status-worker|smoke)\/).*\.ts$|([^/]+\/)*tsconfig(\..+)?\.json$|package\.json$|package-lock\.json$)/;
+            const typecheckChanged =
+              fileListTruncated ||
+              changedFiles.some((file) => typecheckPattern.test(file));
+
+            core.setOutput("typecheck_changed", String(typecheckChanged));
+
+      - uses: actions/checkout@v7
+        if: steps.changes.outputs.typecheck_changed == 'true'
+      - uses: actions/setup-node@v6
+        if: steps.changes.outputs.typecheck_changed == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Cache node_modules
+        if: steps.changes.outputs.typecheck_changed == 'true'
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+
+      - name: Install dependencies
+        if: steps.changes.outputs.typecheck_changed == 'true' && steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Typecheck all targets
+        if: steps.changes.outputs.typecheck_changed == 'true'
+        run: |
+          set -uo pipefail
+          failed=()
+          # Pass each command as separate argv (no eval / no string parsing),
+          # so a future target with shell metacharacters cannot be misparsed.
+          run_target() {
+            local label="$1"
+            shift
+            echo "::group::typecheck ${label}"
+            if "$@"; then
+              echo "${label}: ok"
+            else
+              echo "::error::typecheck ${label} failed"
+              failed+=("${label}")
+            fi
+            echo "::endgroup::"
+          }
+          run_target workflows node scripts/typecheck-workflows.mjs
+          run_target root npx tsc --noEmit
+          run_target cli npm run -w @trycycloid/cli typecheck
+          run_target control npm run -w @cycloid/control-plane-worker typecheck
+          run_target ui npm run -w cycloid-ui typecheck
+          run_target bridge npm run -w @cycloid/sandbox-bridge typecheck
+          run_target status npm run -w @cycloid/status-worker typecheck
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "Typecheck targets failed: ${failed[*]}"
+            exit 1
+          fi
+          echo "All typecheck targets passed."
+
+      - name: Skip typecheck when irrelevant
+        if: steps.changes.outputs.typecheck_changed != 'true'
+        run: echo "No typecheck-relevant changes detected; typecheck skipped."

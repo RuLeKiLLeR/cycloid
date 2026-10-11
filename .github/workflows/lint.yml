@@ -1,0 +1,67 @@
+name: Lint
+
+on:
+  pull_request:
+    branches: [main]
+    # Include label events so toggling `e2b-template-prebuilt` re-evaluates the
+    # production E2B template-set guard without requiring another push.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Cache node_modules
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+      - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Run changed-file lint
+        if: github.event_name == 'pull_request'
+        run: npm run lint:changed
+      - name: Guard production E2B template set
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ALLOW_NEW_PROD_TEMPLATE: ${{ contains(github.event.pull_request.labels.*.name, 'e2b-template-prebuilt') }}
+        run: |-
+          set -euo pipefail
+          BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          args=(--base "$BASE" --head "$HEAD_SHA")
+          if [ "$ALLOW_NEW_PROD_TEMPLATE" = "true" ]; then
+            args+=(--allow-new-prod-template)
+          fi
+          bash scripts/guard-prod-e2b-template-set.sh "${args[@]}"
+      - name: Run full format check
+        if: github.event_name == 'push'
+        run: npm run format:check
+      - name: Run full lint
+        if: github.event_name == 'push'
+        run: npx eslint .

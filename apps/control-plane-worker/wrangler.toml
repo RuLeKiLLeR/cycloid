@@ -1,0 +1,465 @@
+name = "cycloid-control-plane-production"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+logpush = false
+
+[version_metadata]
+binding = "VERSION_METADATA"
+
+[placement]
+mode = "smart"
+
+# Durable Objects
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
+
+[[durable_objects.bindings]]
+name = "SESSION_RESUME_RATE_LIMITER"
+class_name = "SessionResumeRateLimiterDO"
+
+[[durable_objects.bindings]]
+name = "OPENAI_GATEWAY_BUDGET"
+class_name = "OpenAIGatewayBudgetDO"
+
+[[durable_objects.bindings]]
+name = "SESSION_FEED"
+class_name = "SessionFeedDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionDO", "EventBusDO"]
+
+[[migrations]]
+tag = "v2"
+deleted_classes = ["EventBusDO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SessionResumeRateLimiterDO"]
+
+[[migrations]]
+tag = "v4"
+new_classes = ["OpenAIGatewayBudgetDO"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["SessionFeedDO"]
+
+# D1
+[[d1_databases]]
+binding = "DB"
+database_name = "cycloid-control-plane-production"
+database_id = "059c5222-7851-45fe-80c7-c7a47a4ba594"
+
+# Vectorize
+# Index setup before enablement:
+#   wrangler vectorize create cycloid-memory-context-production --dimensions=1536 --metric=cosine
+#   wrangler vectorize create-metadata-index cycloid-memory-context-production --property-name=tenant_key --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-production --property-name=repo_key --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-production --property-name=scope_key --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-production --property-name=source_kind --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-production --property-name=active --type=boolean
+[[vectorize]]
+binding = "MEMORY_VECTOR_INDEX"
+index_name = "cycloid-memory-context-production"
+
+# KV
+[[kv_namespaces]]
+binding = "REPOS_CACHE"
+id = "05e778d4f6a245b196753cc5fdc56385"
+
+[[kv_namespaces]]
+binding = "RATE_LIMITS"
+id = "dbf3d289e12641c5bb574b581b1b6656"
+
+[[kv_namespaces]]
+binding = "DERIVED_MODELS"
+id = "fdfdc30597e142e6a7114352b2882a62"
+
+# R2
+# Freestyle boot artifact store (ARC-1512 / ARC-1566): each prod deploy that can
+# change the bridge bundle or start-bridge.sh publishes their gzipped payloads here
+# (content-addressed blobs + bridge/current.json / start-bridge/current.json
+# pointers) via scripts/publish-bridge-bundle.mjs; the control plane injects them at
+# session start so Freestyle base snapshots cannot silently ship stale boot code.
+# Bucket provisioned by scripts/ensure-cloudflare-r2-buckets.sh.
+[[r2_buckets]]
+binding = "BRIDGE_BUNDLES"
+bucket_name = "cycloid-bridge-bundles"
+
+# Queues (trace export)
+[[queues.producers]]
+queue = "cycloid-traces"
+binding = "TRACE_QUEUE"
+
+[[queues.consumers]]
+queue = "cycloid-traces"
+max_batch_size = 100
+max_batch_timeout = 30
+# Bound retries so a poison-pill batch cannot retry forever (a single bad batch
+# re-fired the trace-export monitor for 5 hours on 2026-05-29). DLQ'd batches
+# are telemetry spans, not user work: no DLQ consumer, Cloudflare drops them
+# after retention and that is acceptable loss.
+max_retries = 3
+dead_letter_queue = "cycloid-traces-dlq"
+
+# Queues (memory analysis)
+[[queues.producers]]
+queue = "cycloid-memory-analysis"
+binding = "MEMORY_ANALYSIS_QUEUE"
+
+[[queues.consumers]]
+queue = "cycloid-memory-analysis"
+max_batch_size = 1
+max_batch_timeout = 0
+# No DLQ on purpose: each message is only a {jobId} pointer to a D1 row in
+# memory_analysis_jobs. If retries exhaust and the batch drops, the */5 cron
+# sweep re-enqueues stale jobs (getReenqueueableMemoryJobs) until
+# MEMORY_JOB_MAX_ATTEMPTS, then terminalizes them. Nothing is silently lost.
+max_retries = 2
+
+# Queues (company memory refine)
+[[queues.producers]]
+queue = "cycloid-memory-refine"
+binding = "MEMORY_REFINE_QUEUE"
+
+[[queues.consumers]]
+queue = "cycloid-memory-refine"
+max_batch_size = 5
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "cycloid-memory-refine-dlq"
+
+[[queues.producers]]
+queue = "cycloid-memory-refine-dlq"
+binding = "MEMORY_REFINE_DLQ"
+
+# Queues (sandbox layer builds)
+[[queues.producers]]
+queue = "cycloid-sandbox-layer-builds"
+binding = "SANDBOX_LAYER_BUILD_QUEUE"
+
+[[queues.consumers]]
+queue = "cycloid-sandbox-layer-builds"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 2
+
+# Cron triggers
+# - "* * * * *" — review-loop epoch dispatch only. The router skips this tick
+#   on minutes where the full sweep also fires to avoid duplicate claim churn.
+# - "*/5 * * * *" — fast sweep: warm probe, automation, recovery, health,
+#   review-loop, memory, and runtime cleanup.
+# - "17 * * * *" — hourly GC: auth/session, Slack disambiguation, webhook
+#   idempotency, and integration lifecycle retention pruning.
+[triggers]
+crons = ["* * * * *", "*/5 * * * *", "17 * * * *"]
+
+# Observability (logs retained in Cloudflare, queryable via dashboard + API)
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = false
+
+# Local dev
+[dev]
+port = 3000
+
+# Environment variables
+[vars]
+VERBOSE_EVENTS = "true"
+WORKER_ENV = "production"
+CONTROL_PLANE_URL = "https://api.trycycloid.com"
+GITHUB_CALLBACK_URL = "https://app.trycycloid.com/auth/callback"
+JIRA_OAUTH_CALLBACK_URL = "https://app.trycycloid.com/auth/jira/callback"
+LINEAR_OAUTH_CALLBACK_URL = "https://app.trycycloid.com/auth/linear/callback"
+NOTION_OAUTH_CALLBACK_URL = "https://app.trycycloid.com/auth/notion/callback"
+SLACK_OAUTH_CALLBACK_URL = "https://app.trycycloid.com/auth/slack/callback"
+SLACK_INSTALL_CALLBACK_URL = "https://app.trycycloid.com/auth/slack/install/callback"
+FRONTEND_URL = "https://app.trycycloid.com"
+# Second allowlisted UI origin: the internal dogfood deploy of the UI redesign,
+# served from internal.app.trycycloid.com against this same prod control plane.
+# Only GitHub sign-in honors it (redirect_uri + post-login host chosen from a
+# strict X-Forwarded-Host allowlist). Integration OAuth stays pinned to app.
+# QA sets this empty (no internal UI host on QA).
+INTERNAL_FRONTEND_URL = "https://internal.app.trycycloid.com"
+LOG_LEVEL = "info"
+# Internal Slack channel (#oom-alert) for onboarding "sandbox undersized" OOM
+# alerts. Empty disables the Slack post; the Datadog metric still fires. The
+# Cycloid bot must be invited to the channel for posts to land.
+SANDBOX_UNDERSIZED_NOTIFY_SLACK_CHANNEL = "C0BAMDKFV63"
+# Bare stem; the worker appends `-mem<MB>-cpu<N>` (default tier resolves to
+# arc-default-template-mem4096-cpu2). See resolveRuntimeTemplateId.
+E2B_SANDBOX_TEMPLATE = "arc-default-template"
+E2B_REPO_SNAPSHOT_MAP_JSON = "{\"trycycloid/excalidraw-demo@main\":{\"snapshotId\":\"f5hkb65xmueiz9eme07e\",\"allowPrivate\":true}}"
+# Freestyle sandbox runtime (prod flip 2026-07-06; ARC-1400). Repo-org-locked:
+# only sessions on trycycloid-org repos route to Freestyle; customer repos stay
+# on E2B. Kill switch: set FREESTYLE_SANDBOX_BACKEND_OVERRIDE to "" and redeploy —
+# new sessions revert to E2B; in-flight sessions stay pinned via affinity.
+FREESTYLE_DEFAULT_SNAPSHOT_ID = "sh-oqd4vrtk2araj4vj90io"
+# Per-repo prebaked snapshots (repo pre-cloned + deps installed; built by
+# scripts/freestyle-build-repo-snapshot.mjs, registered in the capability map in
+# base-template-service.ts). Same shape as E2B_REPO_SNAPSHOT_MAP_JSON. Kill switch:
+# remove the entry (or empty the var) — sessions fall back to the base snapshot.
+# PAIRING RULE: a snapshot pins a disk FLOOR. If the mapped repo also has an
+# explicit REPO_SANDBOX_SPECS sizing entry, its diskGB must be >= the disk the
+# snapshot was built with (--disk-gb), or every create for the repo can reject.
+FREESTYLE_REPO_SNAPSHOT_MAP_JSON = "{\"trycycloid/cycloid\":{\"snapshotId\":\"sh-uxeq4e8pjym6o7zp5khx\",\"allowPrivate\":true}}"
+# ARC-1476: must stay above PROMPT_MAX_DURATION_MS (30 min) with margin so a single
+# max-length prompt cannot network-idle self-suspend mid-run. See freestyle-client.ts.
+FREESTYLE_IDLE_TIMEOUT_SECONDS = "2400"
+# ARC-1512 stopgap: kill switch engaged — Freestyle base snapshot carries a stale
+# bridge bundle; new sessions revert to E2B (fresh bridge via template rebuild)
+# until boot-time bundle delivery lands. Restore to "org:trycycloid" after.
+FREESTYLE_SANDBOX_BACKEND_OVERRIDE = ""
+# Override the 24h auto-close grace by setting milliseconds; empty falls back to AUTO_CLOSE_GRACE_MS.
+SESSION_AUTO_CLOSE_GRACE_MS = ""
+GITHUB_HEALTH_ENABLED = "true"
+GITHUB_HEALTH_REPO_OWNER = "trycycloid"
+GITHUB_HEALTH_REPO_NAME = "cycloid"
+GITHUB_HEALTH_INTERVAL_MS = "21600000"
+SENTRY_HEALTH_SYNTHETIC_ENABLED = "true"
+SENTRY_HEALTH_SYNTHETIC_REPO_OWNER = "trycycloid"
+SENTRY_HEALTH_SYNTHETIC_REPO_NAME = "cycloid"
+SENTRY_HEALTH_SYNTHETIC_INTERVAL_MS = "86400000"
+SENTRY_HEALTH_SYNTHETIC_TIMEOUT_MS = "1800000"
+DATADOG_HEALTH_INTERVAL_MS = "21600000"
+DATADOG_HEALTH_SYNTHETIC_ENABLED = "true"
+DATADOG_HEALTH_SYNTHETIC_REPO_OWNER = "trycycloid"
+DATADOG_HEALTH_SYNTHETIC_REPO_NAME = "cycloid"
+DATADOG_HEALTH_SYNTHETIC_INTERVAL_MS = "86400000"
+DATADOG_HEALTH_SYNTHETIC_TIMEOUT_MS = "1800000"
+LINEAR_HEALTH_INTERVAL_MS = "21600000"
+MEMORY_REPO_SINK = "d1"
+JIRA_HEALTH_INTERVAL_MS = "21600000"
+MEMORY_REFINE_MONTHLY_USD_CAP_PER_BUSINESS = "50000000"
+# Slack OAuth v2 — SLACK_CLIENT_ID and SLACK_CLIENT_SECRET are in Cloudflare secrets (synced from SSM)
+
+# =========================================================================
+# QA environment
+# =========================================================================
+# Deployed via `.github/workflows/deploy-control-plane-qa.yml`
+# (workflow_dispatch only). Prod deploy is unchanged: the top-level config
+# above is still used when no `--env` flag is passed.
+#
+# OPERATOR: Before the first QA deploy, replace the REPLACE_WITH_QA_*
+# placeholders with real IDs from:
+#   wrangler d1 create cycloid-control-plane-qa
+#   wrangler kv namespace create REPOS_CACHE --env qa
+#   wrangler kv namespace create RATE_LIMITS --env qa
+#   wrangler kv namespace create DERIVED_MODELS --env qa
+#   wrangler queues create cycloid-traces-qa
+#   wrangler queues create cycloid-traces-dlq-qa
+#   wrangler queues create cycloid-memory-analysis-qa
+#   wrangler queues create cycloid-memory-refine-qa
+#   wrangler queues create cycloid-memory-refine-dlq-qa
+#   wrangler queues create cycloid-sandbox-layer-builds-qa
+# The deploy workflow refuses to run while placeholders remain.
+# =========================================================================
+
+[env.qa]
+name = "cycloid-control-plane-qa"
+workers_dev = false
+logpush = false
+
+[env.qa.version_metadata]
+binding = "VERSION_METADATA"
+
+[env.qa.placement]
+mode = "off"
+
+[[env.qa.durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
+
+[[env.qa.durable_objects.bindings]]
+name = "SESSION_RESUME_RATE_LIMITER"
+class_name = "SessionResumeRateLimiterDO"
+
+[[env.qa.durable_objects.bindings]]
+name = "OPENAI_GATEWAY_BUDGET"
+class_name = "OpenAIGatewayBudgetDO"
+
+[[env.qa.durable_objects.bindings]]
+name = "SESSION_FEED"
+class_name = "SessionFeedDO"
+
+[[env.qa.migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionDO", "EventBusDO"]
+
+[[env.qa.migrations]]
+tag = "v2"
+deleted_classes = ["EventBusDO"]
+
+[[env.qa.migrations]]
+tag = "v3"
+new_sqlite_classes = ["SessionResumeRateLimiterDO"]
+
+[[env.qa.migrations]]
+tag = "v4"
+new_classes = ["OpenAIGatewayBudgetDO"]
+
+[[env.qa.migrations]]
+tag = "v5"
+new_sqlite_classes = ["SessionFeedDO"]
+
+[[env.qa.d1_databases]]
+binding = "DB"
+database_name = "cycloid-control-plane-qa"
+database_id = "ad10ff78-3f9b-4567-a937-50873ac41d9c"
+
+# Vectorize
+# Index setup before enablement:
+#   wrangler vectorize create cycloid-memory-context-qa --dimensions=1536 --metric=cosine
+#   wrangler vectorize create-metadata-index cycloid-memory-context-qa --property-name=tenant_key --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-qa --property-name=repo_key --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-qa --property-name=scope_key --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-qa --property-name=source_kind --type=string
+#   wrangler vectorize create-metadata-index cycloid-memory-context-qa --property-name=active --type=boolean
+[[env.qa.vectorize]]
+binding = "MEMORY_VECTOR_INDEX"
+index_name = "cycloid-memory-context-qa"
+
+[[env.qa.kv_namespaces]]
+binding = "REPOS_CACHE"
+id = "b119ebb8e6b34423a002e57fa7c9b630"
+
+[[env.qa.kv_namespaces]]
+binding = "RATE_LIMITS"
+id = "2bb267cd2017406d904d78757d62a705"
+
+[[env.qa.kv_namespaces]]
+binding = "DERIVED_MODELS"
+id = "b146092e685d4da183205b9165cd799a"
+
+# R2 (Freestyle boot artifact store; mirrors prod — see the production binding comment)
+[[env.qa.r2_buckets]]
+binding = "BRIDGE_BUNDLES"
+bucket_name = "cycloid-bridge-bundles-qa"
+
+[[env.qa.queues.producers]]
+queue = "cycloid-traces-qa"
+binding = "TRACE_QUEUE"
+
+[[env.qa.queues.consumers]]
+queue = "cycloid-traces-qa"
+max_batch_size = 100
+max_batch_timeout = 30
+# Mirrors the prod cycloid-traces consumer: bounded retries + DLQ, no consumer.
+max_retries = 3
+dead_letter_queue = "cycloid-traces-dlq-qa"
+
+[[env.qa.queues.producers]]
+queue = "cycloid-memory-analysis-qa"
+binding = "MEMORY_ANALYSIS_QUEUE"
+
+[[env.qa.queues.consumers]]
+queue = "cycloid-memory-analysis-qa"
+max_batch_size = 1
+max_batch_timeout = 0
+# No DLQ on purpose: see the production cycloid-memory-analysis consumer.
+max_retries = 2
+
+[[env.qa.queues.producers]]
+queue = "cycloid-memory-refine-qa"
+binding = "MEMORY_REFINE_QUEUE"
+
+[[env.qa.queues.consumers]]
+queue = "cycloid-memory-refine-qa"
+max_batch_size = 5
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "cycloid-memory-refine-dlq-qa"
+
+[[env.qa.queues.producers]]
+queue = "cycloid-memory-refine-dlq-qa"
+binding = "MEMORY_REFINE_DLQ"
+
+[[env.qa.queues.producers]]
+queue = "cycloid-sandbox-layer-builds-qa"
+binding = "SANDBOX_LAYER_BUILD_QUEUE"
+
+[[env.qa.queues.consumers]]
+queue = "cycloid-sandbox-layer-builds-qa"
+max_batch_size = 1
+max_batch_timeout = 0
+max_retries = 2
+
+[env.qa.triggers]
+crons = ["* * * * *", "*/5 * * * *", "17 * * * *"]
+
+[env.qa.observability]
+enabled = true
+head_sampling_rate = 1
+
+[env.qa.observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = false
+
+[env.qa.vars]
+VERBOSE_EVENTS = "true"
+WORKER_ENV = "qa"
+# OAuth callbacks + the post-login redirect all target the UI host so that
+# Set-Cookie headers land on qa.app.trycycloid.com (where the browser is)
+# instead of the API host. The UI worker proxies /auth/* through to the
+# control-plane worker at qa.trycycloid.com, so the API logic is unchanged.
+CONTROL_PLANE_URL = "https://qa.trycycloid.com"
+GITHUB_CALLBACK_URL = "https://qa.app.trycycloid.com/auth/callback"
+JIRA_OAUTH_CALLBACK_URL = "https://qa.app.trycycloid.com/auth/jira/callback"
+# QA has no Linear OAuth app; keep this blank so auth routes use their local
+# fallback if someone exercises the disabled integration in QA.
+LINEAR_OAUTH_CALLBACK_URL = "https://qa.app.trycycloid.com/auth/linear/callback"
+NOTION_OAUTH_CALLBACK_URL = "https://qa.app.trycycloid.com/auth/notion/callback"
+SLACK_OAUTH_CALLBACK_URL = "https://qa.app.trycycloid.com/auth/slack/callback"
+SLACK_INSTALL_CALLBACK_URL = "https://qa.app.trycycloid.com/auth/slack/install/callback"
+FRONTEND_URL = "https://qa.app.trycycloid.com"
+# Empty: QA has no internal dogfood UI host; the resolver treats empty as absent
+# and the sign-in redirect allowlist stays FRONTEND_URL-only on QA.
+INTERNAL_FRONTEND_URL = ""
+LOG_LEVEL = "info"
+SANDBOX_UNDERSIZED_NOTIFY_SLACK_CHANNEL = "C0BAMDKFV63"
+# Stable bare stem (mirrors prod's arc-default-template); the worker appends
+# `-mem<MB>-cpu<N>` (default tier resolves to cycloid-sandbox-qa-mem4096-cpu2).
+# deploy-e2b-sandbox-qa.yml builds the suffixed tiers; no --var override, so a
+# bare control-plane deploy can't reset it. See resolveRuntimeTemplateId.
+E2B_SANDBOX_TEMPLATE = "cycloid-sandbox-qa"
+E2B_REPO_SNAPSHOT_MAP_JSON = ""
+# Freestyle sandbox runtime. QA stays on E2B (override empty); the snapshot id/idle
+# vars keep prod↔QA var-surface parity and are inert while the override is unset.
+FREESTYLE_DEFAULT_SNAPSHOT_ID = ""
+# No per-repo prebaked snapshots on QA (retained for prod<->QA var-surface parity).
+FREESTYLE_REPO_SNAPSHOT_MAP_JSON = ""
+# ARC-1476: keep above PROMPT_MAX_DURATION_MS with margin (mirrors prod). Inert while
+# the override is empty; retained for prod<->QA var-surface parity.
+FREESTYLE_IDLE_TIMEOUT_SECONDS = "2400"
+FREESTYLE_SANDBOX_BACKEND_OVERRIDE = ""
+# Override the 24h auto-close grace by setting milliseconds; empty falls back to AUTO_CLOSE_GRACE_MS.
+SESSION_AUTO_CLOSE_GRACE_MS = ""
+GITHUB_HEALTH_ENABLED = "false"
+GITHUB_HEALTH_REPO_OWNER = "trycycloid"
+GITHUB_HEALTH_REPO_NAME = "cycloid"
+GITHUB_HEALTH_INTERVAL_MS = "21600000"
+SENTRY_HEALTH_SYNTHETIC_ENABLED = "false"
+SENTRY_HEALTH_SYNTHETIC_REPO_OWNER = "trycycloid"
+SENTRY_HEALTH_SYNTHETIC_REPO_NAME = "cycloid"
+SENTRY_HEALTH_SYNTHETIC_INTERVAL_MS = "86400000"
+SENTRY_HEALTH_SYNTHETIC_TIMEOUT_MS = "1800000"
+DATADOG_HEALTH_INTERVAL_MS = "21600000"
+DATADOG_HEALTH_SYNTHETIC_ENABLED = "false"
+DATADOG_HEALTH_SYNTHETIC_REPO_OWNER = "trycycloid"
+DATADOG_HEALTH_SYNTHETIC_REPO_NAME = "cycloid"
+DATADOG_HEALTH_SYNTHETIC_INTERVAL_MS = "86400000"
+DATADOG_HEALTH_SYNTHETIC_TIMEOUT_MS = "1800000"
+LINEAR_HEALTH_INTERVAL_MS = "21600000"
+MEMORY_REPO_SINK = "d1"
+JIRA_HEALTH_INTERVAL_MS = "21600000"
+MEMORY_REFINE_MONTHLY_USD_CAP_PER_BUSINESS = "50000000"

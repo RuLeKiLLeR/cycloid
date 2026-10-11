@@ -1,0 +1,55 @@
+name: Create Sentry Releases
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-control-plane.yml"
+      - ".github/workflows/deploy-e2b-sandbox.yml"
+      - ".github/workflows/sentry-release.yml"
+      - "apps/control-plane-worker/**"
+      - "apps/sandbox-e2b/**"
+      - "apps/sandbox-bridge/**"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/cloudflare-benchmark-gate.mjs"
+      - "scripts/generate-installation-token.py"
+      - "scripts/e2b-template-build.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede an in-flight release run when a newer main push arrives: the
+# release always reflects the latest deployed sha, so cancelling the older
+# run wastes no work and frees the runner sooner.
+concurrency:
+  group: sentry-release
+  cancel-in-progress: true
+
+jobs:
+  sentry-release:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Create Sentry release (control-plane)
+        uses: getsentry/action-release@ff07929a6537bac57790c3451cf4d364aca38528 # v3.7.0
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: cycloid
+          SENTRY_PROJECT: cycloid
+        with:
+          environment: production
+
+      - name: Create Sentry release (sandbox-bridge)
+        uses: getsentry/action-release@ff07929a6537bac57790c3451cf4d364aca38528 # v3.7.0
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: cycloid
+          SENTRY_PROJECT: cycloid-sandbox-bridge
+        with:
+          environment: production

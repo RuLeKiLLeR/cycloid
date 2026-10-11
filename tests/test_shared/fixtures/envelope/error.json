@@ -1,0 +1,18 @@
+{
+  "phase": "error",
+  "timestampMs": 1760000000700,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "code": "agent_runtime_error",
+    "message": "Agent runtime exited before completion.",
+    "details": {
+      "exitCode": 1
+    },
+    "bridgeEventType": "session_error",
+    "bridgeData": {
+      "severity": "error"
+    }
+  }
+}

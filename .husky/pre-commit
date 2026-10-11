@@ -1,0 +1,11 @@
+npx lint-staged
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "Lint-staged failed. Fix errors above before committing."
+  exit 1
+fi
+
+# Typecheck is intentionally NOT run here. It is gated at push by .husky/pre-push
+# for local dev, and at publish by the verify.test gate (.cycloid.json) for
+# dogfood sandbox sessions, which use --no-verify on push. Running it on every
+# commit duplicated the publish-time typecheck (~3 min) with no added coverage.

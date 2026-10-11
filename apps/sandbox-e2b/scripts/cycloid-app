@@ -1,0 +1,1909 @@
+#!/usr/bin/env python3
+"""Cycloid app runtime: start/stop/run/reset/seed verbs over the .cycloid.json contract.
+
+Verbs read the resolved runtime contract from ARCANIST_PREVIEW_CONTRACT_JSON, or
+fall back to the local .cycloid.json appRuntime when run manually in a checkout.
+Status messages are written to stderr prefixed `[cycloid-app] ...`. The command
+matrix and exit codes match docs/customer-e2e-runtime.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+DEFAULT_CONTRACT_PATH = Path("/tmp/cycloid-preview-contract.json")
+DEFAULT_EVIDENCE_DIR = Path("/tmp/cycloid-evidence")
+DEFAULT_AUTH_DIR = Path("/tmp/cycloid-auth")
+# Key-NAME manifest of the compose env the last `start` exported (never values).
+# Lets agents/QA self-diagnose "which env keys reached the boot" without access
+# to the resolved contract.
+RUNTIME_ENV_MANIFEST_PATH = DEFAULT_EVIDENCE_DIR / "runtime-env-manifest.json"
+
+# Cross-process readiness state the bridge writes while it boots the preview
+# runtime in the background (non-blocking verification dispatch). Live-app verbs
+# join on it so they wait for the boot instead of failing fast against a
+# not-yet-healthy app. MUST stay in sync with `RUNTIME_READINESS_PATH` in
+# apps/sandbox-bridge/src/services/runtime-readiness-tracker.ts.
+RUNTIME_READINESS_PATH = Path("/tmp/cycloid-runtime-readiness.json")
+RUNTIME_READINESS_POLL_INTERVAL_SECONDS = 1.0
+# Last-resort wait bound (ms) used only when a readiness record carries no usable
+# absolute `deadline` (malformed/truncated bridge write), so the poll loop can
+# never hang indefinitely waiting on a terminal state that may never arrive.
+RUNTIME_READINESS_FALLBACK_TIMEOUT_MS = 15 * 60 * 1000
+# Set by the bridge ONLY on its own background `cycloid-app start` subprocess so
+# that boot owner does not deadlock waiting on the readiness state it is itself
+# responsible for resolving.
+RUNTIME_BOOT_OWNER_ENV = "ARCANIST_RUNTIME_BOOT_OWNER"
+# Agent-shell boot requests: a caller without the resolved contract env writes
+# this trigger file (no secrets, bare timestamp) and the bridge -- when armed
+# for this session -- answers by running the managed credentialed boot and
+# recording readiness state. MUST stay in sync with
+# `RUNTIME_BOOT_REQUEST_PATH` in
+# apps/sandbox-bridge/src/services/runtime-readiness-tracker.ts.
+RUNTIME_BOOT_REQUEST_PATH = Path("/tmp/cycloid-runtime-boot-request.json")
+# How long an agent-shell `start` waits for the bridge to acknowledge a boot
+# request (a readiness record appearing) before falling back to the committed
+# .cycloid.json boot this shell is limited to.
+RUNTIME_BOOT_REQUEST_HANDSHAKE_SECONDS = 5.0
+RUNTIME_BOOT_REQUEST_POLL_INTERVAL_SECONDS = 0.2
+START_DOCKERD_PATH = Path("/app/scripts/start-dockerd.sh")
+RESERVED_COMPOSE_ENV_PREFIXES = ("DOCKER_", "COMPOSE_")
+LOG_PREFIX = "[cycloid-app]"
+
+# Default evidence-source directories scanned when e2e.evidence is not declared
+# (Phase-1 schema doesn't include the evidence field; these cover Playwright +
+# Cypress defaults so prototype runs collect something useful).
+DEFAULT_EVIDENCE_CANDIDATES: tuple[str, ...] = (
+    "playwright-report",
+    ".playwright-traces",
+    ".playwright-videos",
+    "test-results",
+    "cypress/videos",
+    "cypress/screenshots",
+)
+STARTUP_LOG_TAIL_BYTES = 4000
+DIAGNOSTIC_OUTPUT_TAIL_BYTES = 12000
+DIAGNOSTIC_TIMEOUT_SECONDS = 20
+AUTH_COMMAND_OUTPUT_TAIL_BYTES = 4000
+DOCKER_CLEANUP_OUTPUT_TAIL_BYTES = 4000
+DOCKER_INFO_TIMEOUT_SECONDS = 10
+DOCKERD_START_TIMEOUT_SECONDS = 90
+SENSITIVE_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|KEY|PASSWORD|PASS|COOKIE|CREDENTIAL|AUTH)", re.IGNORECASE)
+TOKEN_LIKE_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[psuor]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b"
+)
+
+
+def log(message: str) -> None:
+    sys.stderr.write(f"{LOG_PREFIX} {message}\n")
+    sys.stderr.flush()
+
+
+def _tail_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"[truncated]\n{text[-max_chars:]}"
+
+
+def _redact_command_output(text: str, env: dict[str, str]) -> str:
+    redacted = text
+    for name, value in env.items():
+        if not value or len(value) < 4 or not SENSITIVE_ENV_NAME_RE.search(name):
+            continue
+        redacted = redacted.replace(value, "[redacted]")
+    return TOKEN_LIKE_RE.sub("[redacted]", redacted)
+
+
+def _log_command_output(label: str, text: str | None, env: dict[str, str]) -> None:
+    if not text:
+        return
+    sanitized = _tail_text(_redact_command_output(text, env).strip(), AUTH_COMMAND_OUTPUT_TAIL_BYTES)
+    if sanitized:
+        log(f"auth command {label}:\n{sanitized}")
+
+
+def _path(value: object, fallback: str = "/") -> str:
+    text = value if isinstance(value, str) and value.strip() else fallback
+    return text if text.startswith("/") else f"/{text}"
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and value.isdigit() and int(value) > 0:
+        return int(value)
+    return None
+
+
+def _string_map(value: object | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise RuntimeError("Runtime contract env fields must be objects")
+    result: dict[str, str] = {}
+    for key, entry_value in value.items():
+        if not isinstance(key, str) or not isinstance(entry_value, str):
+            raise RuntimeError("Runtime contract env fields must contain only string keys and values")
+        result[key] = entry_value
+    return result
+
+
+def _repo_relative(root: Path, value: object, field: str) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"Runtime contract field {field} is required")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise RuntimeError(f"Runtime contract field {field} must be repo-relative and cannot contain '..'")
+    resolved_root = root.resolve()
+    resolved = (resolved_root / path).resolve()
+    if os.path.commonpath([str(resolved_root), str(resolved)]) != str(resolved_root):
+        raise RuntimeError(f"Runtime contract field {field} must stay inside the repository")
+    return resolved
+
+
+def repo_root_for_cwd(cwd: Path) -> Path:
+    workspace_repo = Path("/workspace/repo").resolve()
+    resolved_cwd = cwd.resolve()
+    try:
+        if os.path.commonpath([str(workspace_repo), str(resolved_cwd)]) == str(workspace_repo):
+            return workspace_repo
+    except ValueError:
+        pass
+    return resolved_cwd
+
+
+def safe_compose_env(value: object | None) -> dict[str, str]:
+    env = _string_map(value)
+    return {
+        key: entry_value
+        for key, entry_value in env.items()
+        if not any(key.startswith(prefix) for prefix in RESERVED_COMPOSE_ENV_PREFIXES)
+    }
+
+
+def generated_compose_env(value: object | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise RuntimeError("Runtime contract generatedComposeEnv must be an object")
+
+    result: dict[str, str] = {}
+    for key, spec in value.items():
+        if not isinstance(key, str) or not key:
+            raise RuntimeError("Runtime contract generatedComposeEnv keys must be non-empty strings")
+        if any(key.startswith(prefix) for prefix in RESERVED_COMPOSE_ENV_PREFIXES):
+            continue
+        if not isinstance(spec, dict):
+            raise RuntimeError("Runtime contract generatedComposeEnv values must be objects")
+        if spec.get("type") != "hex":
+            raise RuntimeError('Runtime contract generatedComposeEnv values must declare type="hex"')
+        byte_count = _positive_int(spec.get("bytes"))
+        if byte_count is None or byte_count > 128:
+            raise RuntimeError("Runtime contract generatedComposeEnv hex bytes must be in the range 1-128")
+        result[key] = secrets.token_hex(byte_count)
+    return result
+
+
+def compose_env_with_generated(contract: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    compose_env = safe_compose_env(contract.get("composeEnv"))
+    generated_env = generated_compose_env(contract.get("generatedComposeEnv"))
+    if not generated_env:
+        return contract, compose_env
+
+    overlapping = sorted(set(compose_env).intersection(generated_env))
+    if overlapping:
+        raise RuntimeError(f"Runtime contract generatedComposeEnv overlaps composeEnv: {', '.join(overlapping)}")
+
+    merged_env = {**compose_env, **generated_env}
+    return {**contract, "composeEnv": merged_env}, merged_env
+
+
+def ensure_default_env_file(cwd: Path, compose_env: dict[str, str]) -> Path | None:
+    """Write composeEnv to `<cwd>/.env` if the file does not yet exist.
+
+    Must run BEFORE `docker compose config` because compose errors out when
+    a `env_file: .env` directive (or implicit project-level `.env` lookup)
+    points at a missing file -- which means we never get to read the parsed
+    compose config to know what env_file paths the customer declared.
+
+    Skipped if composeEnv is empty or the file already exists (customer's
+    file wins). Returns the materialized path or None.
+    """
+    if not compose_env:
+        return None
+    target = (cwd / ".env").resolve()
+    try:
+        if os.path.commonpath([str(cwd.resolve()), str(target)]) != str(cwd.resolve()):
+            return None
+    except ValueError:
+        return None
+    if target.exists():
+        log(f".env already exists at {target}; preserving customer content")
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(f"{key}={value}" for key, value in compose_env.items()) + "\n"
+    target.write_text(content, encoding="utf-8")
+    log(f"materialized {target} from composeEnv ({len(compose_env)} vars) before compose parse")
+    return target
+
+
+def materialize_compose_env_files(cwd: Path, services_config: dict[str, Any], compose_env: dict[str, str]) -> list[Path]:
+    """When the parsed compose YAML references `env_file` paths that don't
+    exist on disk, write the contract's composeEnv values to those files.
+
+    Customers like cal.diy declare `env_file: .env` in their compose YAML and
+    expect the file to be present. Our runtime contract carries the values in
+    `composeEnv`, but compose's `env_file` directive specifically wants a file
+    on disk — host env is not enough. We bridge that gap here.
+
+    Customer-declared paths that already exist are left alone (the customer's
+    file wins). Paths outside `cwd` are skipped to avoid touching anything
+    outside the cloned repo.
+    """
+    if not compose_env:
+        return []
+    written: list[Path] = []
+    seen: set[Path] = set()
+    resolved_root = cwd.resolve()
+    for service_config in services_config.values():
+        if not isinstance(service_config, dict):
+            continue
+        env_files = service_config.get("env_file")
+        if env_files is None:
+            continue
+        if isinstance(env_files, str):
+            env_files = [env_files]
+        if not isinstance(env_files, list):
+            continue
+        for entry in env_files:
+            path_str = entry.get("path") if isinstance(entry, dict) else entry
+            if not isinstance(path_str, str) or not path_str.strip():
+                continue
+            target = (cwd / path_str).resolve() if not Path(path_str).is_absolute() else Path(path_str).resolve()
+            try:
+                if os.path.commonpath([str(resolved_root), str(target)]) != str(resolved_root):
+                    log(f"skipping env_file outside cwd: {target}")
+                    continue
+            except ValueError:
+                continue
+            if target in seen:
+                continue
+            seen.add(target)
+            if target.exists():
+                log(f"env_file {target} already exists; preserving customer content")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = "\n".join(f"{key}={value}" for key, value in compose_env.items()) + "\n"
+            target.write_text(content, encoding="utf-8")
+            log(f"materialized {target} from composeEnv ({len(compose_env)} vars)")
+            written.append(target)
+    return written
+
+
+def cycloid_config_path_for_cwd(cwd: Path) -> Path | None:
+    start = cwd.resolve()
+    for directory in (start, *start.parents):
+        candidate = directory / ".cycloid.json"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_preview_contract_from_config(cwd: Path) -> dict[str, Any]:
+    config_path = cycloid_config_path_for_cwd(cwd)
+    if config_path is None:
+        raise RuntimeError("ARCANIST_PREVIEW_CONTRACT_JSON is not set and .cycloid.json was not found")
+
+    try:
+        parsed = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{config_path} is invalid JSON: {error}") from error
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{config_path} must be a JSON object")
+    app_runtime = parsed.get("appRuntime")
+    if not isinstance(app_runtime, dict):
+        raise RuntimeError(f"{config_path} must contain an appRuntime object")
+
+    return {**app_runtime, "cwd": str(config_path.parent)}
+
+
+def load_preview_contract() -> dict[str, Any]:
+    raw = os.environ.get("ARCANIST_PREVIEW_CONTRACT_JSON")
+    if not raw:
+        return load_preview_contract_from_config(Path.cwd())
+    try:
+        contract = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"ARCANIST_PREVIEW_CONTRACT_JSON is invalid JSON: {error}") from error
+    if not isinstance(contract, dict):
+        raise RuntimeError("ARCANIST_PREVIEW_CONTRACT_JSON must be an object")
+    return contract
+
+
+def _stable_contract_for_reuse(contract: dict[str, Any], *, ignore_env_inputs: bool = False) -> dict[str, Any]:
+    """Fields that affect the running preview container/process.
+
+    The started contract also contains resolved runtime details such as
+    portMapping. That should not force a restart. cwd must: verifier before/after
+    capture can switch from a baseline worktree to the final worktree while
+    keeping the same entry/env/url, and reusing the old container would capture
+    the wrong checkout. Environment inputs should also force a restart: a
+    baseline capture may start an app without login env, then post-change
+    evidence can learn the login flow and provide composeEnv. Reusing the old
+    container in that case keeps the app misconfigured.
+    """
+    generated_keys = (
+        set(contract["generatedComposeEnv"].keys()) if isinstance(contract.get("generatedComposeEnv"), dict) else set()
+    )
+    compose_env = contract.get("composeEnv")
+    stable_compose_env = (
+        {key: value for key, value in compose_env.items() if key not in generated_keys}
+        if isinstance(compose_env, dict)
+        else compose_env
+    )
+    if isinstance(stable_compose_env, dict) and not stable_compose_env:
+        stable_compose_env = None
+    def _none_if_empty(value: Any) -> Any:
+        return None if isinstance(value, dict) and not value else value
+
+    stable = {
+        "cwd": contract.get("cwd"),
+        "entry": contract.get("entry"),
+        # Committed contracts omit these where resolved contracts may carry {};
+        # normalize so absent == empty and only real declared changes restart.
+        "env": _none_if_empty(contract.get("env")),
+        "composeEnv": stable_compose_env,
+        "generatedComposeEnv": _none_if_empty(contract.get("generatedComposeEnv")),
+        # Only the host port identifies the running container. url.path is a
+        # probe/preview detail the server sanitizer may normalize away (e.g. it
+        # drops path "/"), so comparing the whole url object recycles a healthy
+        # stack over a cosmetic difference.
+        "urlHostPort": (contract.get("url") or {}).get("hostPort") if isinstance(contract.get("url"), dict) else None,
+    }
+    if ignore_env_inputs:
+        # A caller without ARCANIST_PREVIEW_CONTRACT_JSON (agent shell) only sees
+        # the committed .cycloid.json, whose composeEnv structurally cannot
+        # match the platform-resolved one (repo env vars, declared credentials
+        # merged server-side). Comparing it would recycle a credential-bearing
+        # stack into a credential-less one, so ONLY composeEnv is excluded.
+        # env and generatedComposeEnv are committed-visible and still compare,
+        # and structural fields (cwd/entry/url) always force a restart.
+        stable.pop("composeEnv")
+    return stable
+
+
+def can_reuse_started_contract(
+    existing: dict[str, Any],
+    requested: dict[str, Any],
+    *,
+    ignore_env_inputs: bool = False,
+) -> bool:
+    return _stable_contract_for_reuse(existing, ignore_env_inputs=ignore_env_inputs) == _stable_contract_for_reuse(
+        requested, ignore_env_inputs=ignore_env_inputs
+    )
+
+
+def host_port(contract: dict[str, Any]) -> int:
+    url = contract.get("url")
+    port = _positive_int(url.get("hostPort") if isinstance(url, dict) else None)
+    if port is None:
+        raise RuntimeError("Runtime contract is missing url.hostPort")
+    return port
+
+
+def compose_project_name(port: int) -> str:
+    return f"cycloid-preview-{port}"
+
+
+def ready_path(contract: dict[str, Any]) -> str:
+    ready = contract.get("ready") if isinstance(contract.get("ready"), dict) else {}
+    open_config = contract.get("open") if isinstance(contract.get("open"), dict) else {}
+    return _path(ready.get("path") if isinstance(ready, dict) else None) if ready else _path(open_config.get("path"))
+
+
+def ready_timeout(contract: dict[str, Any], fallback: int) -> int:
+    ready = contract.get("ready")
+    if isinstance(ready, dict):
+        timeout = _positive_int(ready.get("timeoutSeconds"))
+        if timeout:
+            return timeout
+    return fallback
+
+
+def is_app_healthy(contract: dict[str, Any]) -> bool:
+    """Single ready-probe attempt; used for idempotency + run preflight."""
+    try:
+        port = host_port(contract)
+    except RuntimeError:
+        return False
+    url = f"http://127.0.0.1:{port}{ready_path(contract)}"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as err:
+        return err.code < 500
+    except OSError:
+        return False
+
+
+def wait_until_ready(port: int, ready_path_value: str, timeout_seconds: int) -> None:
+    deadline = time.time() + timeout_seconds
+    url = f"http://127.0.0.1:{port}{_path(ready_path_value)}"
+
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                if response.status < 500:
+                    return
+        except urllib.error.HTTPError as err:
+            if err.code < 500:
+                return
+        except OSError:
+            pass
+        time.sleep(1)
+
+    raise TimeoutError(f"Docker preview did not become ready at {url} within {timeout_seconds}s")
+
+
+def compose_base_args(cwd: Path, compose_files: list[Path], profiles: list[str] | None = None) -> list[str]:
+    args = ["docker", "compose"]
+    for profile in profiles or []:
+        args.extend(["--profile", profile])
+    for compose_file in compose_files:
+        args.extend(["-f", str(compose_file if compose_file.is_absolute() else (cwd / compose_file).resolve())])
+    return args
+
+
+def run_logged_result(command: list[str], cwd: Path, env: dict[str, str], log_path: Path) -> subprocess.CompletedProcess[Any]:
+    with log_path.open("ab") as log_file:
+        return subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
+            check=False,
+        )
+
+
+def _logged_command_failure(command: list[str], result: subprocess.CompletedProcess[Any], log_path: Path) -> RuntimeError:
+    command_text = shlex.join(command)
+    return RuntimeError(
+        "\n".join(
+            [
+                f"Docker preview command failed with exit code {result.returncode}: {command_text}",
+                f"Log path: {log_path}",
+                "Startup log tail was withheld from propagated errors because it may contain sensitive runtime data.",
+            ]
+        )
+    )
+
+
+def run_logged(command: list[str], cwd: Path, env: dict[str, str], log_path: Path) -> None:
+    result = run_logged_result(command, cwd, env, log_path)
+    if result.returncode == 0:
+        return
+    raise _logged_command_failure(command, result, log_path)
+
+
+def is_stale_compose_resource_error(text: str) -> bool:
+    return bool(
+        re.search(r"\bnetwork\b.*\bambiguous\b", text, re.IGNORECASE)
+        or re.search(r"\bcontainer name\b.*\balready in use\b", text, re.IGNORECASE)
+        or re.search(r"\bis already in use by container\b", text, re.IGNORECASE)
+    )
+
+
+def _read_text_tail(path: Path, limit: int) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[-limit:]
+    except OSError as err:
+        return f"(failed to read {path}: {err})"
+
+
+def _read_text_tail_from_offset(path: Path, offset: int, limit: int) -> str:
+    try:
+        with path.open("rb") as file:
+            file.seek(max(offset, 0))
+            return file.read().decode("utf-8", errors="replace")[-limit:]
+    except OSError as err:
+        return f"(failed to read {path}: {err})"
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _decode_diagnostic_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _run_diagnostic_command(command: list[str], cwd: Path, env: dict[str, str]) -> str:
+    command_text = shlex.join(command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=DIAGNOSTIC_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as err:
+        output = _decode_diagnostic_output(err.stdout) + _decode_diagnostic_output(err.stderr)
+        return "\n".join(
+            [
+                f"$ {command_text}",
+                f"timed out after {DIAGNOSTIC_TIMEOUT_SECONDS}s",
+                (output[-DIAGNOSTIC_OUTPUT_TAIL_BYTES:].strip() or "(empty)"),
+            ]
+        )
+    except OSError as err:
+        return "\n".join([f"$ {command_text}", f"failed: {err}"])
+
+    output = (result.stdout or "")[-DIAGNOSTIC_OUTPUT_TAIL_BYTES:]
+    return "\n".join(
+        [
+            f"$ {command_text}",
+            f"exit={result.returncode}",
+            output.strip() or "(empty)",
+        ]
+    )
+
+
+def _append_cleanup_log(log_path: Path, text: str) -> None:
+    try:
+        with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
+            log_file.write(text.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def _docker_cleanup_command(command: list[str], cwd: Path, env: dict[str, str], log_path: Path) -> tuple[bool, str]:
+    command_text = shlex.join(command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=DIAGNOSTIC_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as err:
+        output = _decode_diagnostic_output(err.stdout) + _decode_diagnostic_output(err.stderr)
+        sanitized = _tail_text(_redact_command_output(output, env).strip(), DOCKER_CLEANUP_OUTPUT_TAIL_BYTES)
+        message = "\n".join([f"$ {command_text}", f"timed out after {DIAGNOSTIC_TIMEOUT_SECONDS}s", sanitized or "(empty)"])
+        _append_cleanup_log(log_path, message)
+        log(f"cleanup command timed out: {command_text}\n{sanitized or '(empty)'}")
+        return False, sanitized
+    except OSError as err:
+        message = f"$ {command_text}\nfailed: {err}"
+        _append_cleanup_log(log_path, message)
+        log(f"cleanup command failed to launch: {command_text}: {err}")
+        return False, str(err)
+
+    output = _tail_text(_redact_command_output(result.stdout or "", env).strip(), DOCKER_CLEANUP_OUTPUT_TAIL_BYTES)
+    _append_cleanup_log(log_path, "\n".join([f"$ {command_text}", f"exit={result.returncode}", output or "(empty)"]))
+    if result.returncode == 0:
+        return True, output
+    if is_already_removed_docker_output(output):
+        log(f"cleanup command found resources already removed: {command_text}\n{output or '(empty)'}")
+        return True, output
+    log(f"cleanup command failed exit={result.returncode}: {command_text}\n{output or '(empty)'}")
+    return False, output
+
+
+def is_already_removed_docker_output(text: str) -> bool:
+    return bool(re.search(r"\b(?:no such|not found|already (?:removed|gone)|does not exist)\b", text, re.IGNORECASE))
+
+
+def is_active_endpoints_docker_output(text: str) -> bool:
+    return bool(re.search(r"\bactive endpoints?\b", text, re.IGNORECASE))
+
+
+def _docker_list_lines(command: list[str], cwd: Path, env: dict[str, str], log_path: Path) -> list[str] | None:
+    command_text = shlex.join(command)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=DIAGNOSTIC_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as err:
+        log(f"cleanup discovery failed for {command_text}: {err}")
+        return None
+    if result.returncode != 0:
+        output = _tail_text(_redact_command_output(result.stdout or "", env).strip(), DOCKER_CLEANUP_OUTPUT_TAIL_BYTES)
+        _append_cleanup_log(log_path, "\n".join([f"$ {command_text}", f"exit={result.returncode}", output or "(empty)"]))
+        log(f"cleanup discovery failed exit={result.returncode}: {command_text}\n{output or '(empty)'}")
+        return None
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def _docker_ids_by_label(resource: str, project_name: str, cwd: Path, env: dict[str, str], log_path: Path) -> set[str] | None:
+    command = ["docker", resource, "ls", "-q", "--filter", f"label=com.docker.compose.project={project_name}"]
+    if resource == "container":
+        command.insert(3, "-a")
+    lines = _docker_list_lines(
+        command,
+        cwd,
+        env,
+        log_path,
+    )
+    if lines is None:
+        return None
+    return set(lines)
+
+
+def _name_matches_project(name: str, project_name: str) -> bool:
+    normalized = name.removeprefix("/")
+    return normalized.startswith(f"{project_name}-") or normalized.startswith(f"{project_name}_")
+
+
+def _docker_named_resources(resource: str, project_name: str, cwd: Path, env: dict[str, str], log_path: Path) -> set[str] | None:
+    command = ["docker", resource, "ls", "--format", "{{json .}}"]
+    if resource == "container":
+        command.insert(3, "-a")
+    lines = _docker_list_lines(command, cwd, env, log_path)
+    if lines is None:
+        return None
+    matches: set[str] = set()
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        raw_name = item.get("Name") if resource != "container" else item.get("Names")
+        if not isinstance(raw_name, str):
+            continue
+        names = [part.strip() for part in raw_name.split(",") if part.strip()] if resource == "container" else [raw_name]
+        if not any(_name_matches_project(name, project_name) for name in names):
+            continue
+        identifier = item.get("ID") if resource in {"container", "network"} else item.get("Name")
+        if isinstance(identifier, str) and identifier.strip():
+            matches.add(identifier.strip())
+    return matches
+
+
+def preview_project_resource_ids(project_name: str, cwd: Path, env: dict[str, str], log_path: Path) -> dict[str, set[str]] | None:
+    resources: dict[str, set[str]] = {}
+    for resource in ("container", "network", "volume"):
+        labeled = _docker_ids_by_label(resource, project_name, cwd, env, log_path)
+        named = _docker_named_resources(resource, project_name, cwd, env, log_path)
+        if labeled is None or named is None:
+            return None
+        resources[resource] = labeled | named
+    return resources
+
+
+def preview_project_has_resources(project_name: str, cwd: Path, env: dict[str, str], log_path: Path) -> bool:
+    resources = preview_project_resource_ids(project_name, cwd, env, log_path)
+    return any(values for values in resources.values()) if resources is not None else False
+
+
+def cleanup_preview_project(project_name: str, cwd: Path, env: dict[str, str], log_path: Path) -> bool:
+    """Remove Docker resources owned by one cycloid preview project.
+
+    Scope is intentionally narrow: Compose project labels first, with a fallback
+    to Docker's generated project-name prefixes for stale resources that lost
+    labels or duplicate networks that confuse `docker compose down`.
+    """
+    resources = preview_project_resource_ids(project_name, cwd, env, log_path)
+    if resources is None:
+        return False
+
+    log(
+        "targeted cleanup for "
+        f"{project_name}: containers={len(resources['container'])} "
+        f"networks={len(resources['network'])} volumes={len(resources['volume'])}"
+    )
+    if resources["container"]:
+        _docker_cleanup_command(["docker", "container", "rm", "-f", *sorted(resources["container"])], cwd, env, log_path)
+
+    resources = preview_project_resource_ids(project_name, cwd, env, log_path)
+    if resources is None:
+        return False
+
+    if resources["network"]:
+        network_command = ["docker", "network", "rm", *sorted(resources["network"])]
+        for attempt in range(3):
+            ok, output = _docker_cleanup_command(network_command, cwd, env, log_path)
+            if ok or not is_active_endpoints_docker_output(output):
+                break
+            if attempt < 2:
+                log(f"network cleanup still has active endpoints for {project_name}; retrying")
+                time.sleep(0.5)
+    if resources["volume"]:
+        _docker_cleanup_command(["docker", "volume", "rm", *sorted(resources["volume"])], cwd, env, log_path)
+
+    remaining = preview_project_resource_ids(project_name, cwd, env, log_path)
+    if remaining is None:
+        return False
+    if not any(remaining.values()):
+        return True
+    remaining_message = (
+        "targeted cleanup left resources for "
+        f"{project_name}: containers={len(remaining['container'])} "
+        f"networks={len(remaining['network'])} volumes={len(remaining['volume'])}"
+    )
+    _append_cleanup_log(log_path, remaining_message)
+    log(remaining_message)
+    return False
+
+
+def compose_startup_diagnostics(compose_args: list[str], cwd: Path, env: dict[str, str], log_path: Path) -> str:
+    """Return bounded Docker Compose state for a startup that never became ready."""
+    return "\n".join(
+        [
+            "Startup diagnostics:",
+            f"Startup log path: {log_path}",
+            "Startup command log tail:",
+            _read_text_tail(log_path, STARTUP_LOG_TAIL_BYTES).strip() or "(empty)",
+            "docker compose ps:",
+            _run_diagnostic_command([*compose_args, "ps"], cwd, env),
+            "docker compose logs:",
+            _run_diagnostic_command([*compose_args, "logs", "--no-color", "--tail", "120"], cwd, env),
+        ]
+    )
+
+
+def ensure_docker_ready(env: dict[str, str], start_script: Path = START_DOCKERD_PATH) -> None:
+    try:
+        info_result = subprocess.run(
+            ["docker", "info"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=DOCKER_INFO_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as err:
+        raise RuntimeError(
+            f"Timed out after {DOCKER_INFO_TIMEOUT_SECONDS}s waiting for `docker info`; "
+            "Docker is unresponsive, so the preview app cannot start."
+        ) from err
+    if info_result.returncode == 0:
+        return
+    if not start_script.is_file():
+        raise RuntimeError("Docker daemon is not running and start-dockerd.sh is unavailable")
+    try:
+        subprocess.run(
+            [str(start_script)],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            check=True,
+            timeout=DOCKERD_START_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as err:
+        raise RuntimeError(
+            f"Timed out after {DOCKERD_START_TIMEOUT_SECONDS}s waiting for start-dockerd.sh; "
+            "Docker did not become ready, so the preview app cannot start."
+        ) from err
+
+
+def compose_config(cwd: Path, compose_files: list[Path], env: dict[str, str], profiles: list[str] | None = None) -> dict[str, Any]:
+    command = [*compose_base_args(cwd, compose_files, profiles), "config", "--format", "json"]
+    result = subprocess.run(
+        command,
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "\n".join(
+                [
+                    f"Docker Compose config failed with exit code {result.returncode}: {shlex.join(command)}",
+                    result.stderr.strip() or result.stdout.strip() or "(empty)",
+                ]
+            )
+        )
+    parsed = json.loads(result.stdout)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Docker Compose config did not produce an object")
+    return parsed
+
+
+def _port_target(value: object) -> int | None:
+    if isinstance(value, dict):
+        return _positive_int(value.get("target"))
+    if isinstance(value, str):
+        without_protocol = value.split("/")[0]
+        parts = [part.strip() for part in without_protocol.split(":") if part.strip()]
+        if not parts:
+            return None
+        return _positive_int(parts[-1])
+    return _positive_int(value)
+
+
+def _port_published(value: object) -> int | None:
+    if isinstance(value, dict):
+        return _positive_int(value.get("published"))
+    if isinstance(value, str):
+        without_protocol = value.split("/")[0]
+        parts = [part.strip() for part in without_protocol.split(":") if part.strip()]
+        if len(parts) >= 2:
+            return _positive_int(parts[-2])
+    return None
+
+
+def _expose_port(value: object) -> int | None:
+    if isinstance(value, str):
+        return _positive_int(value.split("/")[0])
+    return _positive_int(value)
+
+
+def infer_container_port(service_config: dict[str, Any], host_port_value: int) -> int:
+    ports = service_config.get("ports")
+    port_entries = ports if isinstance(ports, list) else []
+    matching = [_port_target(entry) for entry in port_entries if _port_published(entry) == host_port_value]
+    matching = [port for port in matching if port is not None]
+    if len(matching) == 1:
+        return matching[0]
+
+    targets = [_port_target(entry) for entry in port_entries]
+    targets = [port for port in targets if port is not None]
+    if len(targets) == 1:
+        return targets[0]
+
+    expose = service_config.get("expose")
+    expose_entries = expose if isinstance(expose, list) else []
+    exposed = [_expose_port(entry) for entry in expose_entries]
+    exposed = [port for port in exposed if port is not None]
+    if len(exposed) == 1:
+        return exposed[0]
+
+    raise RuntimeError(
+        "Could not infer container port for selected service; configure appRuntime.portMapping.containerPort"
+    )
+
+
+def _additional_ports(contract: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = contract.get("additionalPorts")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise RuntimeError("Runtime contract additionalPorts must be an array")
+    ports: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Runtime contract additionalPorts[{index}] must be an object")
+        host = _positive_int(entry.get("hostPort"))
+        if host is None:
+            raise RuntimeError(f"Runtime contract additionalPorts[{index}].hostPort must be a positive port")
+        service = entry.get("service")
+        if service is not None and (not isinstance(service, str) or not service.strip()):
+            raise RuntimeError(f"Runtime contract additionalPorts[{index}].service must be a non-empty string")
+        container = None if entry.get("containerPort") is None else _positive_int(entry.get("containerPort"))
+        if entry.get("containerPort") is not None and container is None:
+            raise RuntimeError(f"Runtime contract additionalPorts[{index}].containerPort must be a positive port")
+        ports.append(
+            {
+                "service": service.strip() if isinstance(service, str) else None,
+                "hostPort": host,
+                "containerPort": container,
+            }
+        )
+    return ports
+
+
+def resolve_port_bindings(
+    services: dict[str, Any],
+    primary_service: str,
+    primary_host_port: int,
+    configured_container_port: int | None,
+    contract: dict[str, Any],
+) -> tuple[list[dict[str, int | str]], list[dict[str, int | str]]]:
+    primary_config = services[primary_service]
+    primary_container_port = configured_container_port or infer_container_port(primary_config, primary_host_port)
+    all_bindings: list[dict[str, int | str]] = [
+        {"service": primary_service, "hostPort": primary_host_port, "containerPort": primary_container_port}
+    ]
+    additional_bindings: list[dict[str, int | str]] = []
+    seen_host_ports = {primary_host_port}
+
+    for entry in _additional_ports(contract):
+        service = entry["service"] or primary_service
+        host = entry["hostPort"]
+        if host in seen_host_ports:
+            raise RuntimeError(f"Runtime contract exposes host port {host} more than once")
+        if service not in services or not isinstance(services[service], dict):
+            available = sorted(services)
+            raise RuntimeError(f"Runtime contract additionalPorts service {service!r} was not found; services={available}")
+        container = entry["containerPort"] or infer_container_port(services[service], host)
+        binding = {"service": service, "hostPort": host, "containerPort": container}
+        all_bindings.append(binding)
+        additional_bindings.append(binding)
+        seen_host_ports.add(host)
+
+    return all_bindings, additional_bindings
+
+
+def _service_start_list(primary_service: str, additional_bindings: list[dict[str, int | str]]) -> list[str]:
+    services = [primary_service]
+    seen = {primary_service}
+    for binding in additional_bindings:
+        service = str(binding["service"])
+        if service not in seen:
+            services.append(service)
+            seen.add(service)
+    return services
+
+
+def _services_with_unmanaged_ports(
+    services: dict[str, Any],
+    managed_port_services: set[str],
+) -> list[str]:
+    unmanaged: list[str] = []
+    for service_name, service_config in services.items():
+        if service_name in managed_port_services:
+            continue
+        if not isinstance(service_config, dict):
+            continue
+        ports = service_config.get("ports")
+        if isinstance(ports, list) and len(ports) > 0:
+            unmanaged.append(service_name)
+    return unmanaged
+
+
+def write_override_file(
+    service_name: str,
+    host_port_value: int,
+    container_port: int,
+    service_env: dict[str, str],
+    additional_ports: list[dict[str, int | str]] | None = None,
+    disabled_port_services: list[str] | None = None,
+) -> Path:
+    override_path = Path(f"/tmp/cycloid-docker-preview-{host_port_value}.override.yml")
+    bindings = [
+        {"service": service_name, "hostPort": host_port_value, "containerPort": container_port},
+        *(additional_ports or []),
+    ]
+    ports_by_service: dict[str, list[dict[str, int | str]]] = {}
+    service_order: list[str] = []
+    for binding in bindings:
+        service = str(binding["service"])
+        if service not in ports_by_service:
+            ports_by_service[service] = []
+            service_order.append(service)
+        ports_by_service[service].append(binding)
+
+    lines = ["services:"]
+    for service in service_order:
+        lines.extend([f"  {service}:", "    ports: !override"])
+        for binding in ports_by_service[service]:
+            lines.append(f'      - "{binding["hostPort"]}:{binding["containerPort"]}"')
+        if service == service_name and service_env:
+            lines.append("    environment:")
+            for key, value in service_env.items():
+                lines.append(f"      {key}: {json.dumps(value)}")
+    for service in disabled_port_services or []:
+        if service in ports_by_service:
+            continue
+        lines.extend([f"  {service}:", "    ports: !override []"])
+    lines.append("")
+    override_path.write_text("\n".join(lines), encoding="utf-8")
+    return override_path
+
+
+def compose_files_for_entry(repo_root: Path, entry: dict[str, Any]) -> list[Path]:
+    files = entry.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("Compose runtime contract entry.files is required")
+    return [_repo_relative(repo_root, file, "entry.files") for file in files]
+
+
+def synthesize_dockerfile_compose(repo_root: Path, entry: dict[str, Any], host_port_value: int) -> Path:
+    context = _repo_relative(repo_root, entry.get("context"), "entry.context")
+    dockerfile = _repo_relative(repo_root, entry.get("dockerfile"), "entry.dockerfile")
+    service = entry.get("service")
+    if not isinstance(service, str) or not service.strip():
+        raise RuntimeError("Dockerfile runtime contract entry.service is required")
+    compose_path = Path(f"/tmp/cycloid-docker-preview-{host_port_value}.dockerfile.compose.yml")
+    compose_path.write_text(
+        "\n".join(
+            [
+                "services:",
+                f"  {service}:",
+                "    build:",
+                f"      context: {json.dumps(str(context))}",
+                f"      dockerfile: {json.dumps(str(dockerfile))}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return compose_path
+
+
+def resolve_compose_artifacts(contract: dict[str, Any]) -> tuple[Path, list[Path], list[str], str, int]:
+    """Re-resolve cwd / compose file list / profiles / service / host port from a contract.
+
+    Used by stop/run/reset/seed so they target the same compose project that
+    `start` brought up. Mirrors the resolution path inside start_preview() so
+    behavior stays in lockstep.
+    """
+    cwd_raw = contract.get("cwd")
+    if not isinstance(cwd_raw, str) or not cwd_raw:
+        raise RuntimeError("Runtime contract is missing cwd")
+    cwd = Path(cwd_raw).resolve()
+    repo_root = repo_root_for_cwd(cwd)
+    entry = contract.get("entry")
+    if not isinstance(entry, dict):
+        raise RuntimeError("Runtime contract is missing entry")
+    service = entry.get("service")
+    if not isinstance(service, str) or not service.strip():
+        raise RuntimeError("Runtime contract entry.service is required")
+    port = host_port(contract)
+
+    profiles_raw = entry.get("profiles") if isinstance(entry.get("profiles"), list) else []
+    profiles = [profile for profile in profiles_raw if isinstance(profile, str) and profile.strip()]
+
+    if entry.get("type") == "compose":
+        compose_files = compose_files_for_entry(repo_root, entry)
+    elif entry.get("type") == "dockerfile":
+        compose_files = [synthesize_dockerfile_compose(repo_root, entry, port)]
+    else:
+        raise RuntimeError('Runtime contract entry.type must be "compose" or "dockerfile"')
+
+    return cwd, compose_files, profiles, service, port
+
+
+def _write_runtime_env_manifest(compose_env_dict: dict[str, str]) -> None:
+    """Record which composeEnv KEY NAMES this boot exported (values are never written)."""
+    manifest = {
+        "source": "contract_env" if os.environ.get("ARCANIST_PREVIEW_CONTRACT_JSON") else "committed_fallback",
+        "composeEnvKeys": sorted(compose_env_dict.keys()),
+    }
+    try:
+        RUNTIME_ENV_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RUNTIME_ENV_MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except OSError as error:
+        log(f"could not write runtime env manifest: {error}")
+
+
+def start_preview(contract: dict[str, Any], timeout: int, contract_out: Path) -> dict[str, Any]:
+    cwd_raw = contract.get("cwd")
+    if not isinstance(cwd_raw, str) or not cwd_raw:
+        raise RuntimeError("Runtime contract is missing cwd")
+    cwd = Path(cwd_raw).resolve()
+    if not cwd.exists():
+        raise FileNotFoundError(f"Preview cwd does not exist: {cwd}")
+    if not cwd.is_dir():
+        raise NotADirectoryError(f"Preview cwd is not a directory: {cwd}")
+    repo_root = repo_root_for_cwd(cwd)
+
+    if contract.get("kind") != "web" or contract.get("runner") != "docker":
+        raise RuntimeError("Runtime contract must specify kind=web and runner=docker")
+
+    entry = contract.get("entry")
+    if not isinstance(entry, dict):
+        raise RuntimeError("Runtime contract is missing entry")
+    service = entry.get("service")
+    if not isinstance(service, str) or not service.strip():
+        raise RuntimeError("Runtime contract entry.service is required")
+
+    port = host_port(contract)
+    log_path = Path(f"/tmp/cycloid-preview-{port}.log")
+    contract, compose_env_dict = compose_env_with_generated(contract)
+    _write_runtime_env_manifest(compose_env_dict)
+    env = os.environ.copy()
+    env.update(compose_env_dict)
+    env.setdefault("HOST", "0.0.0.0")
+    env.setdefault("PORT", str(port))
+    env.setdefault("COMPOSE_PROJECT_NAME", compose_project_name(port))
+    project_name = env["COMPOSE_PROJECT_NAME"]
+
+    ensure_docker_ready(env)
+
+    service_env = _string_map(contract.get("env"))
+    profiles = entry.get("profiles") if isinstance(entry.get("profiles"), list) else []
+    profiles = [profile for profile in profiles if isinstance(profile, str) and profile.strip()]
+
+    if entry.get("type") == "compose":
+        compose_files = compose_files_for_entry(repo_root, entry)
+    elif entry.get("type") == "dockerfile":
+        compose_files = [synthesize_dockerfile_compose(repo_root, entry, port)]
+    else:
+        raise RuntimeError('Runtime contract entry.type must be "compose" or "dockerfile"')
+
+    # Write `<cwd>/.env` before parsing compose. Compose errors out when
+    # `env_file: .env` references a missing file, which would prevent us
+    # from ever reading the parsed config -- so the default project-level
+    # `.env` has to be materialized first. Other env_file paths are handled
+    # post-config below.
+    ensure_default_env_file(cwd, compose_env_dict)
+
+    config = compose_config(cwd, compose_files, env, profiles)
+    services = config.get("services")
+    if not isinstance(services, dict) or service not in services or not isinstance(services[service], dict):
+        available = sorted(services) if isinstance(services, dict) else []
+        raise RuntimeError(f"Runtime contract selected service {service!r} was not found; services={available}")
+
+    # If the customer's compose declares `env_file` directives but no file
+    # exists at those paths, write composeEnv to them. This makes
+    # `composeEnv` the single source of truth for both `${VAR}` substitutions
+    # (host env, already populated above) and `env_file:` directives.
+    materialize_compose_env_files(cwd, services, compose_env_dict)
+
+    configured_container_port = None
+    port_mapping = contract.get("portMapping")
+    if isinstance(port_mapping, dict):
+        configured_container_port = _positive_int(port_mapping.get("containerPort"))
+    if entry.get("type") == "dockerfile" and configured_container_port is None:
+        raise RuntimeError("Dockerfile runtime contract requires portMapping.containerPort")
+    port_bindings, additional_port_bindings = resolve_port_bindings(
+        services, service, port, configured_container_port, contract
+    )
+    container_port = int(port_bindings[0]["containerPort"])
+    managed_port_services = {str(binding["service"]) for binding in port_bindings}
+    disabled_port_services = _services_with_unmanaged_ports(services, managed_port_services)
+    override_file = write_override_file(
+        service,
+        port,
+        container_port,
+        service_env,
+        additional_port_bindings,
+        disabled_port_services,
+    )
+    compose_args = compose_base_args(cwd, [*compose_files, override_file], profiles)
+    services_to_start = _service_start_list(service, additional_port_bindings)
+    if preview_project_has_resources(project_name, cwd, env, log_path):
+        log(f"found existing Docker resources for {project_name}; running targeted cleanup before startup")
+        if not cleanup_preview_project(project_name, cwd, env, log_path):
+            raise RuntimeError(
+                "\n".join(
+                    [
+                        f"Targeted Docker cleanup failed before starting {project_name}",
+                        f"Log path: {log_path}",
+                        "Cleanup output was withheld from propagated errors because it may contain sensitive runtime data.",
+                    ]
+                )
+            )
+
+    up_command = [*compose_args, "up", "--build", "-d", *services_to_start]
+    up_log_offset = _file_size(log_path)
+    up_result = run_logged_result(up_command, cwd, env, log_path)
+    if up_result.returncode != 0:
+        log_tail = _read_text_tail_from_offset(log_path, up_log_offset, STARTUP_LOG_TAIL_BYTES)
+        if is_stale_compose_resource_error(log_tail):
+            log(f"docker compose up hit stale resources for {project_name}; cleaning and retrying once")
+            if cleanup_preview_project(project_name, cwd, env, log_path):
+                retry_result = run_logged_result(up_command, cwd, env, log_path)
+                if retry_result.returncode == 0:
+                    log(f"docker compose up succeeded after targeted cleanup for {project_name}")
+                else:
+                    raise RuntimeError(
+                        "\n".join(
+                            [
+                                f"Docker preview command failed with exit code {retry_result.returncode}: {shlex.join(up_command)}",
+                                f"Log path: {log_path}",
+                                "Startup log tail was withheld from propagated errors because it may contain sensitive runtime data.",
+                            ]
+                        )
+                    )
+            else:
+                raise RuntimeError(
+                    "\n".join(
+                        [
+                            f"Targeted Docker cleanup failed after stale-resource startup error for {project_name}",
+                            f"Log path: {log_path}",
+                            "Startup and cleanup diagnostics were withheld from propagated errors because they may contain sensitive runtime data.",
+                        ]
+                    )
+                )
+        else:
+            raise RuntimeError(
+                "\n".join(
+                    [
+                        f"Docker preview command failed with exit code {up_result.returncode}: {shlex.join(up_command)}",
+                        f"Log path: {log_path}",
+                        "Startup log tail was withheld from propagated errors because it may contain sensitive runtime data.",
+                    ]
+                )
+            )
+
+    started_contract = {
+        **contract,
+        "cwd": str(cwd),
+        "portMapping": {"containerPort": container_port},
+    }
+    if additional_port_bindings:
+        started_contract["additionalPorts"] = additional_port_bindings
+    else:
+        started_contract.pop("additionalPorts", None)
+    contract_out.parent.mkdir(parents=True, exist_ok=True)
+    contract_out.write_text(json.dumps(started_contract, indent=2), encoding="utf-8")
+
+    ready = contract.get("ready") if isinstance(contract.get("ready"), dict) else {}
+    try:
+        wait_until_ready(port, _path(ready.get("path") if isinstance(ready, dict) else None), ready_timeout(contract, timeout))
+    except Exception as err:
+        raise RuntimeError(f"{err}\nStartup diagnostics were withheld from propagated errors because they may contain sensitive runtime data.") from err
+
+    return started_contract
+
+
+def request_managed_runtime_boot(
+    path: Path | None = None,
+    readiness_path: Path | None = None,
+    handshake_seconds: float | None = None,
+    now: Any = time.time,
+    sleep: Any = time.sleep,
+) -> bool:
+    """Ask the bridge to run the managed (credentialed) runtime boot.
+
+    Written only from agent shells (no contract env). The request file is a bare
+    trigger carrying no secrets. Returns True when the bridge acknowledged by
+    writing a readiness record within the handshake window -- the caller then
+    joins that boot via wait_for_runtime_readiness. False means no watcher
+    answered (no bridge, no resolved contract for this repo, or a session type
+    without the watcher) and the caller keeps the committed-contract fallback.
+    """
+    if path is None:
+        path = RUNTIME_BOOT_REQUEST_PATH
+    if readiness_path is None:
+        readiness_path = RUNTIME_READINESS_PATH
+    if handshake_seconds is None:
+        handshake_seconds = RUNTIME_BOOT_REQUEST_HANDSHAKE_SECONDS
+    # A retry request often coexists with the previous boot's terminal readiness
+    # record; only a CHANGED record (the bridge re-arming markStarting) counts as
+    # acknowledgment, or the caller would join the stale state and fall back
+    # while the bridge boots concurrently.
+    before = _read_runtime_readiness(readiness_path)
+    try:
+        path.write_text(json.dumps({"requestedAt": int(now() * 1000)}), encoding="utf-8")
+    except OSError as error:
+        log(f"could not write runtime boot request: {error}")
+        return False
+    deadline = now() + handshake_seconds
+    while now() < deadline:
+        current = _read_runtime_readiness(readiness_path)
+        if current is not None and current != before:
+            return True
+        sleep(RUNTIME_BOOT_REQUEST_POLL_INTERVAL_SECONDS)
+    return False
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    # Single-flight: if the bridge is already booting this runtime in the
+    # background, wait for that boot to resolve rather than running our own
+    # cleanup+start concurrently, which would tear down the half-booted app.
+    # `ready` falls through to the idempotent-reuse branch below (attaches to the
+    # healthy app + resolved contract); a failed/timed-out/aborted boot is done,
+    # so falling through to start_preview makes a fresh, non-concurrent attempt.
+    # The boot owner short-circuits inside wait_for_runtime_readiness.
+    readiness = wait_for_runtime_readiness("start")
+
+    contract = load_preview_contract()
+    contract_out = Path(args.contract_out)
+    has_contract_env = bool(os.environ.get("ARCANIST_PREVIEW_CONTRACT_JSON"))
+    is_boot_owner = os.environ.get(RUNTIME_BOOT_OWNER_ENV) == "1"
+
+    # Agent shells cannot boot with the platform-resolved composeEnv, but the
+    # bridge can: request the managed boot and join it. Fired whenever the
+    # managed stack is not actually attachable -- no boot in flight, a terminal
+    # boot, or a stale "ready" whose app/contract is gone (post-stop or crash).
+    # The bridge no-ops duplicates only while a boot is starting.
+    if not has_contract_env and not is_boot_owner:
+        attachable = readiness == "ready" and is_app_healthy(contract) and contract_out.exists()
+        if not attachable:
+            log("no resolved contract in this shell; requesting the bridge-managed credentialed boot")
+            if request_managed_runtime_boot():
+                readiness = wait_for_runtime_readiness("start")
+            else:
+                log("no bridge answered the runtime boot request; continuing with the committed contract")
+
+    # Idempotent reuse: only short-circuit when BOTH the port responds healthy
+    # AND we have a started-contract file from a previous `cycloid-app start`
+    # that we own. A healthy port without our contract file means some other
+    # process is occupying the port -- silently attaching to it would let the
+    # session drive an unintended app. Fall through to start_preview so the
+    # docker-compose port-bind step surfaces the conflict cleanly.
+    #
+    # ignore_env_inputs: a caller without the resolved contract env compares
+    # only structural fields, so it attaches to (never env-recycles) a healthy
+    # stack the bridge booted with credentials it cannot see.
+    if is_app_healthy(contract) and contract_out.exists():
+        try:
+            existing = json.loads(contract_out.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and can_reuse_started_contract(
+                existing, contract, ignore_env_inputs=not has_contract_env
+            ):
+                log("app already healthy and prior cycloid-app contract present; reusing existing contract")
+                _clear_failed_runtime_readiness_after_start()
+                # A caller without the contract env must not receive the
+                # resolved composeEnv values (platform-injected secrets) on
+                # stdout, where they would land in tool output/transcripts.
+                printable = existing if has_contract_env else {k: v for k, v in existing.items() if k != "composeEnv"}
+                sys.stdout.write(json.dumps(printable))
+                sys.stdout.flush()
+                return 0
+            if isinstance(existing, dict):
+                log("app is healthy but runtime contract changed; refreshing preview app")
+        except (OSError, json.JSONDecodeError):
+            log(f"existing contract at {contract_out} is unreadable; falling through to start_preview")
+
+    if not has_contract_env:
+        log(
+            "WARNING: booting from the committed .cycloid.json contract. Platform-injected composeEnv "
+            "(repository env vars, declared credentials) is NOT available to boots from this shell -- "
+            "if the app needs those, the bridge-managed boot must serve this session."
+        )
+    started = start_preview(contract, args.timeout, contract_out)
+    log(f"app started on http://127.0.0.1:{host_port(started)}")
+    _clear_failed_runtime_readiness_after_start()
+    sys.stdout.write(json.dumps(started))
+    sys.stdout.flush()
+    return 0
+
+
+def _read_started_contract(contract_path: Path) -> dict[str, Any] | None:
+    try:
+        existing = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return existing if isinstance(existing, dict) else None
+
+
+def _started_or_input_contract(contract_path: Path) -> dict[str, Any]:
+    """Prefer the started contract on disk (has resolved cwd/portMapping); fall back to env."""
+    started = _read_started_contract(contract_path)
+    if started is not None:
+        return started
+    return load_preview_contract()
+
+
+def _read_runtime_readiness(path: Path | None = None) -> dict[str, Any] | None:
+    if path is None:
+        path = RUNTIME_READINESS_PATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def wait_for_runtime_readiness(
+    label: str,
+    path: Path | None = None,
+    now: Any = time.time,
+    sleep: Any = time.sleep,
+) -> str:
+    """Join on the bridge's background preview boot before touching the live app.
+
+    The bridge launches `cycloid-app start` in the background (non-blocking
+    verification dispatch) and records a cross-process readiness state. Live-app
+    verbs call this so they wait at the door for the boot to finish instead of
+    racing a not-yet-healthy app. Bounded by the absolute `deadline` carried in
+    the state, never a fresh timeout, so a late join cannot extend total startup.
+
+    Returns the terminal readiness state:
+      - "absent": no background boot is in flight (manual / non-verify path, or
+        this process is the boot owner); the caller keeps existing behavior.
+      - "ready": the background boot completed; the resolved contract is on disk.
+      - "failed"/"timed_out"/"aborted": the boot did not produce a healthy app.
+    """
+    # The bridge's own background boot must never wait on the state it owns.
+    if os.environ.get(RUNTIME_BOOT_OWNER_ENV) == "1":
+        return "absent"
+
+    if path is None:
+        path = RUNTIME_READINESS_PATH
+    state = _read_runtime_readiness(path)
+    if state is None:
+        return "absent"
+    status = state.get("state")
+    if status in ("ready", "failed", "timed_out", "aborted"):
+        return status
+    if status != "starting":
+        # Unknown/malformed state: do not hang the agent's tool call.
+        return "absent"
+
+    log(f"{label}: preview runtime is still starting in the background; waiting for readiness")
+    while True:
+        state = _read_runtime_readiness(path)
+        if state is None:
+            # File cleared mid-wait (session stop / cleanup). Stop waiting.
+            return "aborted"
+        status = state.get("state")
+        if status in ("ready", "failed", "timed_out", "aborted"):
+            return status
+        if status != "starting":
+            return "absent"
+        # Bound the wait by the absolute deadline. If the bridge wrote a malformed
+        # record (missing/non-numeric deadline) or crashed mid-write, fall back to
+        # elapsed-since-startedAt so a truncated file can never hang the tool call.
+        deadline = state.get("deadline")
+        if not isinstance(deadline, (int, float)):
+            started_at = state.get("startedAt")
+            if isinstance(started_at, (int, float)):
+                deadline = started_at + RUNTIME_READINESS_FALLBACK_TIMEOUT_MS
+                log(f"{label}: readiness state has no usable deadline; falling back to startedAt + fallback window")
+            else:
+                log(f"{label}: readiness state has no usable deadline or startedAt; treating as timed out")
+                return "timed_out"
+        if now() * 1000 >= deadline:
+            log(f"{label}: preview runtime did not become ready before the startup deadline")
+            return "timed_out"
+        sleep(RUNTIME_READINESS_POLL_INTERVAL_SECONDS)
+
+
+def _clear_failed_runtime_readiness_after_start() -> None:
+    """Drop a stale terminal-FAILURE readiness state after a successful manual
+    `cycloid-app start`, so subsequent run/auth/reset/seed don't keep gating to
+    exit 5 against a runtime that has since been repaired. The bridge owns its own
+    `starting`/`ready` lifecycle, so the background-boot owner skips this.
+    """
+    if os.environ.get(RUNTIME_BOOT_OWNER_ENV) == "1":
+        return
+    state = _read_runtime_readiness()
+    if state and state.get("state") in ("failed", "timed_out", "aborted"):
+        log("clearing stale failed runtime readiness state after successful start")
+        RUNTIME_READINESS_PATH.unlink(missing_ok=True)
+
+
+def gate_on_runtime_readiness(label: str) -> int | None:
+    """Block on the background boot; return an exit code only when it failed.
+
+    None means proceed (ready, or no background boot in flight). A non-zero code
+    means the boot did not produce a healthy app, so the verb surfaces an
+    INCONCLUSIVE-style message instead of racing a half-booted app.
+    """
+    outcome = wait_for_runtime_readiness(label)
+    if outcome in ("ready", "absent"):
+        return None
+    log(
+        f"{label}: preview runtime failed to start in the background (state={outcome}); "
+        "report runtime/browser verification as INCONCLUSIVE and record this in blockers"
+    )
+    return 5
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    contract_path = Path(args.contract_out)
+    started = _read_started_contract(contract_path)
+    if started is None:
+        try:
+            started = load_preview_contract()
+        except RuntimeError as err:
+            log(f"no started contract on disk and input contract is unavailable ({err}); nothing to stop")
+            return 0
+        log("no started contract on disk; using input runtime contract for cleanup")
+    try:
+        cwd, compose_files, profiles, _service, port = resolve_compose_artifacts(started)
+    except RuntimeError as err:
+        port = host_port(started)
+        log_path = Path(f"/tmp/cycloid-preview-{port}.log")
+        env = os.environ.copy()
+        env.update(safe_compose_env(started.get("composeEnv")))
+        env.setdefault("HOST", "0.0.0.0")
+        env.setdefault("PORT", str(port))
+        env.setdefault("COMPOSE_PROJECT_NAME", compose_project_name(port))
+        project_name = env["COMPOSE_PROJECT_NAME"]
+        cwd = Path(started.get("cwd") if isinstance(started.get("cwd"), str) else os.getcwd()).resolve()
+        if not cwd.exists() or not cwd.is_dir():
+            cwd = Path(os.getcwd()).resolve()
+        log(f"could not resolve compose artifacts ({err}); running targeted cleanup for {project_name}")
+        if cleanup_preview_project(project_name, cwd, env, log_path):
+            contract_path.unlink(missing_ok=True)
+            return 0
+        log(f"targeted cleanup failed for {project_name}; preserving contract file at {contract_path}")
+        return 1
+
+    env = os.environ.copy()
+    env.update(safe_compose_env(started.get("composeEnv")))
+    env.setdefault("HOST", "0.0.0.0")
+    env.setdefault("PORT", str(port))
+    env.setdefault("COMPOSE_PROJECT_NAME", compose_project_name(port))
+    project_name = env["COMPOSE_PROJECT_NAME"]
+
+    args_list = compose_base_args(cwd, compose_files, profiles)
+    log_path = Path(f"/tmp/cycloid-preview-{port}.log")
+    down_command = [*args_list, "down", "--volumes", "--remove-orphans"]
+    log(f"running docker compose down --volumes --remove-orphans for project {project_name}")
+    down_result = run_logged_result(down_command, cwd, env, log_path)
+    if down_result.returncode == 0:
+        contract_path.unlink(missing_ok=True)
+        return 0
+
+    log(
+        "\n".join(
+            [
+                f"docker compose down failed for {project_name}; running targeted cleanup",
+                f"Log path: {log_path}",
+                "Log tail:",
+                _read_text_tail(log_path, STARTUP_LOG_TAIL_BYTES).strip() or "(empty)",
+            ]
+        )
+    )
+    if cleanup_preview_project(project_name, cwd, env, log_path):
+        contract_path.unlink(missing_ok=True)
+        return 0
+    else:
+        log(f"targeted cleanup failed for {project_name}; preserving contract file at {contract_path}")
+        return 1
+
+
+def _e2e_block(contract: dict[str, Any]) -> dict[str, Any]:
+    e2e = contract.get("e2e")
+    if not isinstance(e2e, dict):
+        raise RuntimeError("Runtime contract has no e2e block; declare appRuntime.e2e in .cycloid.json")
+    return e2e
+
+
+def _auth_block(contract: dict[str, Any]) -> dict[str, Any] | None:
+    auth = contract.get("auth")
+    return auth if isinstance(auth, dict) else None
+
+
+def _credential_envvars(block: dict[str, Any]) -> list[str]:
+    creds = block.get("credentials")
+    if not isinstance(creds, list):
+        return []
+    names: list[str] = []
+    for entry in creds:
+        if not isinstance(entry, dict):
+            continue
+        env_var = entry.get("envVar")
+        if isinstance(env_var, str) and env_var.strip():
+            names.append(env_var)
+    return names
+
+
+def _base_url(contract: dict[str, Any]) -> str:
+    return f"http://127.0.0.1:{host_port(contract)}"
+
+
+def _app_relative_path(value: object, fallback: str = "/") -> str:
+    text = value if isinstance(value, str) and value.strip() else fallback
+    if (
+        not text.startswith("/")
+        or text.startswith("//")
+        or "\\" in text
+        or "?" in text
+        or "#" in text
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in text)
+        or "://" in text
+    ):
+        raise RuntimeError("Runtime auth validatePath must be an app-relative path like /dashboard")
+    return text
+
+
+def _auth_validate_path(contract: dict[str, Any], auth: dict[str, Any]) -> str:
+    open_config = contract.get("open") if isinstance(contract.get("open"), dict) else {}
+    url_config = contract.get("url") if isinstance(contract.get("url"), dict) else {}
+    fallback = (
+        open_config.get("path")
+        if isinstance(open_config, dict) and isinstance(open_config.get("path"), str)
+        else url_config.get("path")
+        if isinstance(url_config, dict) and isinstance(url_config.get("path"), str)
+        else "/"
+    )
+    return _app_relative_path(auth.get("validatePath"), _path(fallback))
+
+
+def _join_app_url(base_url: str, path: str) -> str:
+    return urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+
+
+def _auth_state_path(contract: dict[str, Any]) -> Path:
+    port = host_port(contract)
+    return DEFAULT_AUTH_DIR / f"preview-{port}" / "storage-state.json"
+
+
+def _validate_storage_state(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        raise RuntimeError("auth command did not produce a storage state file")
+    size = path.stat().st_size
+    if size <= 0 or size > 1024 * 1024:
+        raise RuntimeError("auth storage state file is empty or too large")
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f"auth storage state is not valid JSON: {err}") from err
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("cookies"), list) or not isinstance(parsed.get("origins"), list):
+        raise RuntimeError("auth storage state must be a Playwright object with cookies[] and origins[]")
+
+
+def _evidence_destination() -> Path:
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    dest = DEFAULT_EVIDENCE_DIR / f"e2e-{timestamp}"
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def _collect_evidence(cwd: Path, dest: Path) -> list[str]:
+    collected: list[str] = []
+    for relative in DEFAULT_EVIDENCE_CANDIDATES:
+        source = cwd / relative
+        if not source.exists():
+            continue
+        target = dest / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(source, target)
+            collected.append(relative)
+        except OSError as err:
+            log(f"could not copy evidence {relative}: {err}")
+    return collected
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    gate = gate_on_runtime_readiness("run")
+    if gate is not None:
+        return gate
+    contract_path = Path(args.contract_out)
+    contract = _started_or_input_contract(contract_path)
+    if not is_app_healthy(contract):
+        log("app is not healthy; run `cycloid-app start` first")
+        return 5
+
+    cwd_raw = contract.get("cwd")
+    if not isinstance(cwd_raw, str) or not cwd_raw:
+        raise RuntimeError("Runtime contract is missing cwd")
+    cwd = Path(cwd_raw).resolve()
+
+    if not args.command:
+        log("run requires a command")
+        return 5
+
+    env = os.environ.copy()
+    env.update(safe_compose_env(contract.get("composeEnv")))
+    env.setdefault("HOST", "0.0.0.0")
+    env.setdefault("PORT", str(host_port(contract)))
+    env.setdefault("ARCANIST_APP_HOST_PORT", str(host_port(contract)))
+
+    declared_credentials: list[str] = []
+    e2e = contract.get("e2e")
+    if isinstance(e2e, dict):
+        declared_credentials = _credential_envvars(e2e)
+    missing = [name for name in declared_credentials if not env.get(name)]
+    if missing:
+        log(f"declared credentials missing from environment: {', '.join(missing)}")
+
+    log(f"running: {shlex.join(args.command)} (cwd={cwd})")
+    completed = subprocess.run(
+        args.command,
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+    dest = _evidence_destination()
+    collected = _collect_evidence(cwd, dest)
+    if collected:
+        log(f"collected evidence under {dest}: {', '.join(collected)}")
+    else:
+        log(f"no evidence directories found under {cwd}")
+
+    log(f"command exit={completed.returncode}; evidence={dest}")
+    return completed.returncode
+
+
+def cmd_auth(args: argparse.Namespace) -> int:
+    gate = gate_on_runtime_readiness("auth")
+    if gate is not None:
+        return gate
+    contract_path = Path(args.contract_out)
+    contract = _started_or_input_contract(contract_path)
+    auth = _auth_block(contract)
+    if auth is None:
+        log("auth not configured")
+        return 0
+    if not is_app_healthy(contract):
+        log("app is not healthy; run `cycloid-app start` first")
+        return 5
+
+    command_text = auth.get("command")
+    if not isinstance(command_text, str) or not command_text.strip():
+        log("auth.command is not declared")
+        return 5
+
+    cwd_raw = contract.get("cwd")
+    if not isinstance(cwd_raw, str) or not cwd_raw:
+        raise RuntimeError("Runtime contract is missing cwd")
+    cwd = Path(cwd_raw).resolve()
+
+    env = os.environ.copy()
+    env.update(safe_compose_env(contract.get("composeEnv")))
+    env.setdefault("HOST", "0.0.0.0")
+    env.setdefault("PORT", str(host_port(contract)))
+    env.setdefault("ARCANIST_APP_HOST_PORT", str(host_port(contract)))
+    base_url = _base_url(contract)
+    validate_url = _join_app_url(base_url, _auth_validate_path(contract, auth))
+    state_path = _auth_state_path(contract)
+    env["ARCANIST_BASE_URL"] = base_url
+    env["ARCANIST_AUTH_VALIDATE_URL"] = validate_url
+    env["ARCANIST_AUTH_STATE_PATH"] = str(state_path)
+
+    missing = [name for name in _credential_envvars(auth) if not env.get(name)]
+    if missing:
+        log(f"declared auth credentials missing from environment: {', '.join(missing)}")
+        return 2
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.unlink(missing_ok=True)
+    log(f"auth: {command_text} (cwd={cwd})")
+    completed = subprocess.run(
+        ["sh", "-c", command_text],
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        log(f"auth command exit={completed.returncode}")
+        _log_command_output("stdout", completed.stdout, env)
+        _log_command_output("stderr", completed.stderr, env)
+        return 1
+
+    try:
+        _validate_storage_state(state_path)
+    except RuntimeError as err:
+        log(str(err))
+        return 3
+
+    sys.stdout.write(f"ARCANIST_AUTH_STATE_PATH={state_path}\n")
+    sys.stdout.flush()
+    log(f"auth state ready; validate={validate_url}")
+    return 0
+
+
+def _run_app_command(contract: dict[str, Any], command_text: str, label: str) -> int:
+    cwd_raw = contract.get("cwd")
+    if not isinstance(cwd_raw, str) or not cwd_raw:
+        raise RuntimeError("Runtime contract is missing cwd")
+    cwd = Path(cwd_raw).resolve()
+
+    env = os.environ.copy()
+    env.update(safe_compose_env(contract.get("composeEnv")))
+    env.setdefault("HOST", "0.0.0.0")
+    env.setdefault("PORT", str(host_port(contract)))
+    env.setdefault("ARCANIST_APP_HOST_PORT", str(host_port(contract)))
+
+    log(f"{label}: {command_text} (cwd={cwd})")
+    completed = subprocess.run(
+        ["sh", "-c", command_text],
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    return completed.returncode
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    gate = gate_on_runtime_readiness("reset")
+    if gate is not None:
+        return gate
+    contract = _started_or_input_contract(Path(args.contract_out))
+    e2e = _e2e_block(contract)
+    reset_command = e2e.get("resetCommand")
+    if not isinstance(reset_command, str) or not reset_command.strip():
+        log("e2e.resetCommand is not declared; nothing to reset")
+        return 1
+    code = _run_app_command(contract, reset_command, "reset")
+    if code != 0:
+        return 1
+    seed_command = e2e.get("seedCommand")
+    if isinstance(seed_command, str) and seed_command.strip():
+        if _run_app_command(contract, seed_command, "seed") != 0:
+            return 2
+    return 0
+
+
+def cmd_seed(args: argparse.Namespace) -> int:
+    gate = gate_on_runtime_readiness("seed")
+    if gate is not None:
+        return gate
+    contract = _started_or_input_contract(Path(args.contract_out))
+    e2e = _e2e_block(contract)
+    seed_command = e2e.get("seedCommand")
+    if not isinstance(seed_command, str) or not seed_command.strip():
+        log("e2e.seedCommand is not declared; nothing to seed")
+        return 1
+    return 0 if _run_app_command(contract, seed_command, "seed") == 0 else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--contract-out",
+        default=str(DEFAULT_CONTRACT_PATH),
+        help="Path the resolved runtime contract is read from / written to",
+    )
+    sub = parser.add_subparsers(dest="verb", required=True)
+
+    start = sub.add_parser("start", parents=[common], help="Boot the dockerized app and wait for ready")
+    # 900s default (15 min) gives a customer's first session enough headroom for
+    # a full `docker compose build` cascade -- common for Python/Java apps with
+    # heavy base images. Customers with fast-starting apps can set
+    # `ready.timeoutSeconds` lower in `.cycloid.json` to fail faster.
+    start.add_argument("--timeout", type=int, default=900, help="Seconds to wait for readiness")
+    start.set_defaults(func=cmd_start)
+
+    stop = sub.add_parser("stop", parents=[common], help="Stop the dockerized app and remove the contract file")
+    stop.set_defaults(func=cmd_stop)
+
+    run_p = sub.add_parser("run", parents=[common], help="Run a command against the live app with credentials injected")
+    run_p.add_argument("command", nargs=argparse.REMAINDER, help="The command to exec (e.g. npm run test:e2e)")
+    run_p.set_defaults(func=cmd_run)
+
+    auth = sub.add_parser("auth", parents=[common], help="Run appRuntime.auth.command and validate storage state")
+    auth.set_defaults(func=cmd_auth)
+
+    reset = sub.add_parser("reset", parents=[common], help="Run e2e.resetCommand then e2e.seedCommand")
+    reset.set_defaults(func=cmd_reset)
+
+    seed = sub.add_parser("seed", parents=[common], help="Run e2e.seedCommand only")
+    seed.set_defaults(func=cmd_seed)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as err:
+        sys.stderr.write(f"{LOG_PREFIX} {err}\n")
+        raise SystemExit(1)

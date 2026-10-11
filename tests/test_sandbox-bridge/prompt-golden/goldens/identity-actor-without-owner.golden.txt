@@ -1,0 +1,4 @@
+# Requesting user identity
+
+Treat "Ada Lovelace" as the session owner's identity unless the task explicitly indicates otherwise.
+The current prompt was submitted by Cycloid user ID 77; OWNER_USER_ID is unavailable, so the session owner comparison could not be verified.

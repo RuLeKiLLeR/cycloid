@@ -1,0 +1,110 @@
+# Local dev secrets for wrangler dev
+# Copy to .dev.vars and fill in real values
+# Pull from SSM: aws ssm get-parameters-by-path --path /cycloid/ --with-decryption --query 'Parameters[*].[Name,Value]' --output text
+
+# --- Required (Layer 1: control plane) ---
+
+OPENAI_API_KEY=
+GITHUB_APP_ID=
+GITHUB_PRIVATE_KEY=
+GITHUB_WEBHOOK_SECRET=
+TOKEN_ENCRYPTION_KEY=
+ARCANIST_ADMIN_TOKEN=
+BUILD_CALLBACK_SECRET=
+CI_AUTOMATION_TOKEN=
+EVAL_CALLBACK_SECRET=
+SANDBOX_CALLBACK_SECRET=
+E2B_API_KEY=
+SANDBOX_RUNTIME_CLEANUP_SECRET=replace-me
+
+# Use the Cycloid (dev) GitHub App's client ID and secret
+# (GitHub Settings → Developer settings → GitHub Apps → Cycloid (dev) → Edit)
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+
+# Local overrides (do not change)
+GITHUB_CALLBACK_URL=http://localhost:5173/auth/callback
+FRONTEND_URL=http://localhost:5173
+WORKER_ENV=local
+
+# --- Required (Layer 2: sandbox connectivity) ---
+
+# Auto-set by scripts/dev-tunnel.sh -- do not hardcode this one
+# CONTROL_PLANE_URL=
+# Claimed static ngrok domain used by scripts/dev-tunnel.sh, for example:
+# NGROK_DOMAIN=sludge-sandbox-revoke.ngrok-free.dev
+NGROK_DOMAIN=
+
+# Normal repo sessions use E2B locally. scripts/worktree-setup.sh and
+# npm run dev:full auto-set E2B_SANDBOX_TEMPLATE to cycloid-sandbox-dev-$USER
+# when it is missing. Build that template with:
+#   npm run build:e2b-template -- --dev
+E2B_RUNTIME_RETENTION_HOURS=24
+# Optional E2B network controls. E2B allowOut/denyOut accept IP addresses or
+# CIDR blocks, not hostnames. Comma-separated lists or JSON arrays are accepted.
+# E2B_SANDBOX_ALLOW_INTERNET_ACCESS=true
+# E2B_SANDBOX_NETWORK_ALLOW_OUT=
+# E2B_SANDBOX_NETWORK_DENY_OUT=
+
+# --- Freestyle sandbox runtime ---
+# API key for the Freestyle VM provider. Required only when routing sessions to
+# freestyle via the override below.
+# FREESTYLE_API_KEY=
+# Base snapshot id the FreestyleSandboxClient boots from (built by
+# scripts/freestyle-build-base-snapshot.mjs). Required whenever the override below
+# routes sessions to freestyle — spawns fail closed without it (ARC-1480); a bare
+# Debian cold boot has no bridge bundle and can never start a session.
+# FREESTYLE_DEFAULT_SNAPSHOT_ID=
+# Finite idle-suspend window in seconds (default 900). Never 0/unbounded.
+# FREESTYLE_IDLE_TIMEOUT_SECONDS=900
+# Freestyle routing override: "all" (local only), or a comma list mixing numeric
+# owner user IDs and org:<repo-owner> entries (e.g. "org:trycycloid" routes only
+# sessions on that org's repos). Empty ⇒ every new session stays on e2b_cloud.
+# Any malformed entry disables the whole override ⇒ e2b_cloud.
+FREESTYLE_SANDBOX_BACKEND_OVERRIDE=
+
+# --- Optional (omit to disable) ---
+
+# SENTRY_DSN=
+# Local Worker, UI, and local-targeted sandbox errors are not sent
+# to Sentry unless this is explicitly enabled. Keep disabled by default.
+# SENTRY_ENABLE_LOCAL=true
+# SLACK_BOT_TOKEN=
+# SLACK_SIGNING_SECRET=
+# JIRA_OAUTH_CALLBACK_URL=http://localhost:3000/auth/jira/callback
+# LINEAR_OAUTH_CLIENT_ID=
+# LINEAR_OAUTH_CLIENT_SECRET=
+# LINEAR_OAUTH_CALLBACK_URL=http://localhost:3000/auth/linear/callback
+# LINEAR_WEBHOOK_SECRET=
+# NOTION_OAUTH_CALLBACK_URL=http://localhost:3000/auth/notion/callback
+# SLACK_ALERT_CHANNEL_ID=
+
+# Slack OAuth (requires local SSL proxy -- see scripts/setup-ssl-certs.sh)
+# 1. Run: bash scripts/setup-ssl-certs.sh (one-time)
+# 2. Add https://localhost:3443/auth/slack/callback as redirect URL in Slack app settings.
+#    For workspace bot install testing, also add https://localhost:3443/auth/slack/install/callback.
+# 3. Uncomment and fill in:
+# SLACK_CLIENT_ID=
+# SLACK_CLIENT_SECRET=
+# SLACK_OAUTH_CALLBACK_URL=https://localhost:3443/auth/slack/callback
+# SLACK_INSTALL_CALLBACK_URL=https://localhost:3443/auth/slack/install/callback
+
+# --- OpenAI gateway reconciliation (omit to disable) ---
+
+# OPENAI_ADMIN_API_KEY=
+
+# --- Observability (omit to disable) ---
+
+# Operator Datadog debugging flow:
+#   prompt trace lookup -> dd_trace_id -> trace details
+# These keys are for operator trace/log lookup only. They are distinct from
+# customer-facing runtime observability credentials resolved by the worker.
+# DD_API_KEY=
+# DD_APP_KEY=
+# DD_SITE=us5.datadoghq.com
+# ARCANIST_API_URL=https://app.trycycloid.com
+# BRAINTRUST_API_KEY=
+# S3_ACCESS_KEY_ID=
+# S3_SECRET_ACCESS_KEY=
+# S3_SESSION_BUCKET=
+# GITHUB_HEALTH_OWNER_USER_ID=

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_file="${ARCANIST_GLOBAL_CONFIG:-$HOME/.cycloid/config.json}"
+
+if [ ! -f "$config_file" ]; then
+  echo "error: missing global Cycloid CLI config at $config_file" >&2
+  echo "hint: run cycloid auth login for production first" >&2
+  exit 1
+fi
+
+if ! config_values="$(
+  node - "$config_file" <<'NODE'
+const fs = require("node:fs");
+
+const path = process.argv[2];
+let parsed;
+try {
+  parsed = JSON.parse(fs.readFileSync(path, "utf8"));
+} catch {
+  console.error(`error: could not parse ${path}`);
+  process.exit(1);
+}
+
+if (!parsed || typeof parsed.apiUrl !== "string" || typeof parsed.token !== "string" || !parsed.apiUrl || !parsed.token) {
+  console.error(`error: ${path} must contain apiUrl and token`);
+  console.error("hint: run cycloid auth login for production first");
+  process.exit(1);
+}
+
+process.stdout.write(`${parsed.apiUrl}\n${parsed.token}\n`);
+NODE
+)"; then
+  exit 1
+fi
+
+api_url="${config_values%%$'\n'*}"
+token="${config_values#*$'\n'}"
+
+ARCANIST_API_URL="$api_url" ARCANIST_TOKEN="$token" exec cycloid "$@"

@@ -1,0 +1,114 @@
+name: Validate Deploy Commands
+
+# Deploy jobs in deploy-control-plane-core.yml only run on push to main, so a
+# broken wrangler invocation (an unknown flag, a changed output shape) is never
+# exercised until it has merged, where it blocks the grouped prod deploy for
+# everyone. This job runs the deploy's wrangler commands against the pinned
+# wrangler on the PR itself, using offline-safe modes (dry-run for the build,
+# an argument-parse probe for the auth-gated calls), so that class of break is
+# caught before merge. Keep the command list here mirroring the real `secret`
+# and `versions` invocations in deploy-control-plane-core.yml; the coverage test
+# in tests/test_agent/control-plane-deploy-workflow.test.ts fails the PR if they
+# drift apart.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-control-plane-core.yml"
+      - ".github/workflows/validate-deploy-commands.yml"
+      - "scripts/extract-wrangler-version-id.mjs"
+      - "apps/control-plane-worker/wrangler.toml"
+      - "package-lock.json"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-wrangler-commands:
+    name: validate wrangler commands
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # `versions upload` is the call whose NDJSON output the deploy parses for
+      # the candidate version id. --dry-run builds and emits the machine-readable
+      # record without contacting Cloudflare, so this validates both the flags
+      # and the output contract the deploy's parser depends on.
+      - name: Assert versions upload flags and output contract
+        working-directory: apps/control-plane-worker
+        run: |
+          set -euo pipefail
+          assert_upload() {
+            rm -f /tmp/candidate.ndjson
+            WRANGLER_OUTPUT_FILE_PATH=/tmp/candidate.ndjson \
+              npx wrangler versions upload "$@" --dry-run --var "SENTRY_RELEASE:validate"
+            # Run the deploy's real parser against this output so the guard proves
+            # the actual extractor - not a lookalike - can find the record. Accept
+            # only the two statuses a dry-run can legitimately produce: 0 (wrangler
+            # returned an id) or 3 (record present, id null). Any other exit - 4 (no
+            # record), 5 (read error), or a nonzero parser crash - means the output
+            # contract or the parser is broken; fail closed, because the real deploy
+            # runs this same script under set -e and would break post-merge.
+            set +e
+            node ../../scripts/extract-wrangler-version-id.mjs /tmp/candidate.ndjson >/dev/null 2>/tmp/extract-err
+            code=$?
+            set -e
+            if [ "$code" -ne 0 ] && [ "$code" -ne 3 ]; then
+              echo "::error::versions upload output failed the deploy parser (extractor exit $code); the real deploy would fail here"
+              cat /tmp/extract-err
+              exit 1
+            fi
+            echo "versions upload output contract OK (extractor exit $code): $*"
+          }
+          # The real deploy appends --secrets-file /tmp/control-plane-changed-secrets.json
+          # when secret reconciliation reports changes (deploy-control-plane-core.yml), so
+          # exercise that flag too. Otherwise a wrangler release that changed --secrets-file
+          # would pass this guard and then break the first secret-changing prod/QA deploy.
+          printf '%s' '{"GUARD_PROBE":"validate"}' > /tmp/guard-secrets.json
+          assert_upload --env=""
+          assert_upload --env="" --secrets-file /tmp/guard-secrets.json
+          assert_upload --env qa
+          assert_upload --env qa --secrets-file /tmp/guard-secrets.json
+        env:
+          CLOUDFLARE_API_TOKEN: ""
+          CLOUDFLARE_ACCOUNT_ID: ""
+
+      # secret list / versions deploy need real credentials to run, so they
+      # cannot be dry-run. wrangler rejects unknown flags at argument-parse time,
+      # before any API call, so without credentials a valid invocation fails at
+      # auth while an invalid flag fails with "Unknown argument/option". Assert
+      # the latter never happens for the flags the deploy uses. secret list
+      # passes --name only (never --env): under wrangler's default legacy
+      # environments --env would append "-<env>" to the --name value and target a
+      # nonexistent worker, so the deploy dropped it and this guard mirrors that.
+      - name: Assert auth-gated deploy commands parse
+        working-directory: apps/control-plane-worker
+        run: |
+          set -euo pipefail
+          assert_parses() {
+            local out
+            out=$(npx wrangler "$@" </dev/null 2>&1 || true)
+            if printf '%s' "$out" | grep -qiE "unknown (argument|option|command)"; then
+              echo "::error::wrangler rejected an argument in a deploy command: wrangler $*"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+            echo "parses: wrangler $*"
+          }
+          assert_parses secret list --name cycloid-control-plane-production --format json
+          assert_parses secret list --name cycloid-control-plane-qa --format json
+          assert_parses versions deploy 00000000-0000-0000-0000-000000000000 --yes
+          assert_parses versions deploy 00000000-0000-0000-0000-000000000000 --env qa --yes
+        env:
+          CLOUDFLARE_API_TOKEN: ""
+          CLOUDFLARE_ACCOUNT_ID: ""

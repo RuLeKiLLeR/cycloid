@@ -1,0 +1,9 @@
+name = "linear"
+description = "Linear issue and comment tools."
+module = "./client.ts"
+hosts = ["api.linear.app"]
+
+[[secrets]]
+type = "http"
+name = "LINEAR_ACCESS_TOKEN"
+hosts = ["api.linear.app"]

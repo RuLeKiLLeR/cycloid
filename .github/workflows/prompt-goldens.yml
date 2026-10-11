@@ -1,0 +1,45 @@
+name: Prompt Goldens
+
+# Focused signal for prompt-affecting changes. The sharded backend `test`
+# check already runs this suite; this named check makes a golden diff visible
+# at a glance on PRs that touch the prompt-assembly layer.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      # Any bridge source can feed prompt assembly; the suite is fast, so the
+      # wide filter is cheap insurance against silent golden regressions.
+      - "apps/sandbox-bridge/src/**"
+      - "tests/test_sandbox-bridge/prompt-golden/**"
+      - ".github/workflows/prompt-goldens.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prompt-goldens:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Cache node_modules
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          key: node-modules-v2-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json') }}
+      - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Run prompt golden tests
+        run: npx vitest run tests/test_sandbox-bridge/prompt-golden

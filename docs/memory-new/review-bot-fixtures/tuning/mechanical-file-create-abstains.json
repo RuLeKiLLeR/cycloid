@@ -1,0 +1,115 @@
+{
+  "schema_version": "memory_review_bot_fixture_v1",
+  "fixture_id": "mechanical-file-create-abstains",
+  "fixture_source": "production",
+  "prompt": {
+    "session_id": "8ed59b14-b0e3-427e-a3c4-e4fcc2b36086",
+    "prompt_id": "production-bootstrap-feedback",
+    "task_summary": "Create a file with exact requested content; no repo policy or workflow memory was needed.",
+    "bounded_prompt": "Create one file with the exact requested content. Do not change unrelated behavior.",
+    "outcome_summary": "The task was mechanical and the returned review-loop, webhook, pagination, and Linear memories had no task-specific applicability."
+  },
+  "returned_memories": [
+    {
+      "memory_id": "mf_3820dd2880239f1e6dd5861bba6fcbacd6b91cdb09ee45a1b682a4b1d652e621",
+      "source": "company_bootstrap",
+      "rank": 1,
+      "score": 0.86,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Review-loop changes should preserve status-comment reconciliation and epoch semantics."
+    },
+    {
+      "memory_id": "mf_38e5198526a96e9de1df76e997ce474bea6a38f38999eb8dee91bc52fc95790a",
+      "source": "company_bootstrap",
+      "rank": 2,
+      "score": 0.81,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Webhook handlers need explicit event ordering and retry-safe persistence."
+    },
+    {
+      "memory_id": "mf_9377e1d01007bdffb6673e98cb387b01a87de3af8c05902715bba0caf8f4904c",
+      "source": "company_bootstrap",
+      "rank": 3,
+      "score": 0.79,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Paginated replay endpoints must keep cursor and window-size contracts separate."
+    },
+    {
+      "memory_id": "mf_8fddb06749c0669cc22c46907d939aced454b54105f794251b29e0493fdd2bce",
+      "source": "company_bootstrap",
+      "rank": 4,
+      "score": 0.76,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Linear integration work should preserve webhook registration and attachment handling."
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "ev_prompt_mechanical",
+      "kind": "prompt",
+      "source_ref": "session prompt summary",
+      "snippet": "The user asked for a file creation with exact content, not an investigation or subsystem change."
+    },
+    {
+      "evidence_id": "ev_feedback_downvotes",
+      "kind": "slack",
+      "source_ref": "https://trycycloid.slack.com/archives/C0B9G5TCATB/p1781279778777159",
+      "snippet": "Slack memory-feedback downvoted all four returned memories for this mechanical file task."
+    },
+    {
+      "evidence_id": "ev_memory_topics_unrelated",
+      "kind": "memory",
+      "snippet": "The returned memories concerned review loops, webhooks, pagination, and Linear behavior, none of which changed the exact file content task."
+    }
+  ],
+  "expected": {
+    "prompt_outcome": "false_positive",
+    "evidence_ids": ["ev_prompt_mechanical", "ev_feedback_downvotes"],
+    "memory_results": [
+      {
+        "memory_id": "mf_3820dd2880239f1e6dd5861bba6fcbacd6b91cdb09ee45a1b682a4b1d652e621",
+        "relevance": "irrelevant",
+        "usefulness": "not_useful",
+        "effect": "neutral",
+        "lifecycle_state": "active",
+        "root_causes": ["retrieval"],
+        "evidence_ids": ["ev_prompt_mechanical", "ev_memory_topics_unrelated"],
+        "rationale": "Review-loop guidance did not apply to an exact file creation."
+      },
+      {
+        "memory_id": "mf_38e5198526a96e9de1df76e997ce474bea6a38f38999eb8dee91bc52fc95790a",
+        "relevance": "irrelevant",
+        "usefulness": "not_useful",
+        "effect": "neutral",
+        "lifecycle_state": "active",
+        "root_causes": ["retrieval"],
+        "evidence_ids": ["ev_prompt_mechanical", "ev_memory_topics_unrelated"],
+        "rationale": "Webhook ordering guidance was not relevant to the prompt."
+      },
+      {
+        "memory_id": "mf_9377e1d01007bdffb6673e98cb387b01a87de3af8c05902715bba0caf8f4904c",
+        "relevance": "irrelevant",
+        "usefulness": "not_useful",
+        "effect": "neutral",
+        "lifecycle_state": "active",
+        "root_causes": ["retrieval"],
+        "evidence_ids": ["ev_prompt_mechanical", "ev_memory_topics_unrelated"],
+        "rationale": "Replay pagination guidance was unrelated to exact content creation."
+      },
+      {
+        "memory_id": "mf_8fddb06749c0669cc22c46907d939aced454b54105f794251b29e0493fdd2bce",
+        "relevance": "irrelevant",
+        "usefulness": "not_useful",
+        "effect": "neutral",
+        "lifecycle_state": "active",
+        "root_causes": ["retrieval"],
+        "evidence_ids": ["ev_prompt_mechanical", "ev_memory_topics_unrelated"],
+        "rationale": "Linear integration guidance was not needed."
+      }
+    ]
+  }
+}

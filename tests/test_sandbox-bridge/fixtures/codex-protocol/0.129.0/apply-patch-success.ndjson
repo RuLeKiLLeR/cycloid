@@ -1,0 +1,12 @@
+{"method":"thread/started","params":{"thread":{"id":"thread-1"}}}
+{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}
+{"method":"item/started","params":{"item":{"type":"userMessage","id":"user-1"},"threadId":"thread-1","turnId":"turn-1"}}
+{"method":"item/completed","params":{"item":{"type":"userMessage","id":"user-1"},"threadId":"thread-1","turnId":"turn-1"}}
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"agent-1","text":"","phase":"commentary"},"threadId":"thread-1","turnId":"turn-1"}}
+{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"agent-1","delta":"Applying patch."}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"agent-1","text":"Applying patch.","phase":"commentary"},"threadId":"thread-1","turnId":"turn-1"}}
+{"method":"item/started","params":{"item":{"type":"fileChange","id":"call_apply_1","changes":[{"path":"/tmp/sample.txt","kind":{"type":"update","move_path":null},"diff":"@@ -1 +1 @@\n-old\n+new\n"}],"status":"inProgress"},"threadId":"thread-1","turnId":"turn-1"}}
+{"method":"item/completed","params":{"item":{"type":"fileChange","id":"call_apply_1","changes":[{"path":"/tmp/sample.txt","kind":{"type":"update","move_path":null},"diff":"@@ -1 +1 @@\n-old\n+new\n"}],"status":"completed"},"threadId":"thread-1","turnId":"turn-1"}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"total":{"totalTokens":10,"inputTokens":8,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0},"last":{"totalTokens":10,"inputTokens":8,"cachedInputTokens":0,"outputTokens":2,"reasoningOutputTokens":0},"modelContextWindow":258400}}}
+{"method":"turn/diff/updated","params":{"threadId":"thread-1","turnId":"turn-1","diff":"diff --git a/sample.txt b/sample.txt"}}
+{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}

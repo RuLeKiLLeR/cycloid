@@ -1,0 +1,16 @@
+export const ASSET_CONTENT_TYPES: Record<string, string> = {
+  ".js": "application/javascript",
+  ".css": "text/css",
+  ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".ttf": "font/ttf",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".json": "application/json",
+  ".wasm": "application/wasm",
+};

@@ -1,0 +1,104 @@
+name: Ratchet Tests
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Single always-running job intended for the Protect main required checks.
+  # Keep the job id stable: the required status context is `ratchet-tests`.
+  ratchet-tests:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Detect ratchet-relevant changes
+        id: changes
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+
+            const changedFiles = files.flatMap((file) =>
+              file.previous_filename
+                ? [file.filename, file.previous_filename]
+                : [file.filename],
+            );
+            core.info(`Changed files:\n${changedFiles.join("\n")}`);
+
+            const reportedChangedFiles = context.payload.pull_request.changed_files;
+            const fileListTruncated =
+              Number.isInteger(reportedChangedFiles) &&
+              reportedChangedFiles > changedFiles.length;
+            if (fileListTruncated) {
+              core.warning(
+                `PR reports ${reportedChangedFiles} changed files but only ${changedFiles.length} were retrieved; running ratchet tests fail-closed.`,
+              );
+            }
+
+            const ratchetPattern =
+              /^(apps\/control-plane-worker\/(migrations\/|src\/)|drizzle\/|tests\/test_cloudflare\/(migration-integrity|schema-validation)\.test\.ts$|tests\/test_agent\/ratchet-tests-workflow\.test\.ts$|\.github\/workflows\/ratchet-tests\.yml$)/;
+            const matchedFiles = changedFiles.filter((file) =>
+              ratchetPattern.test(file),
+            );
+            const ratchetChanged = fileListTruncated || matchedFiles.length > 0;
+
+            if (ratchetChanged) {
+              core.info(
+                fileListTruncated
+                  ? "Running ratchet tests because the PR file list was truncated."
+                  : `Running ratchet tests because this PR changed:\n${matchedFiles
+                      .map((file) => `- ${file}`)
+                      .join("\n")}`,
+              );
+            } else {
+              core.info("No ratchet-relevant changes detected.");
+            }
+
+            core.setOutput("ratchet_changed", String(ratchetChanged));
+
+      - uses: actions/checkout@v7
+        if: steps.changes.outputs.ratchet_changed == 'true'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-node@v6
+        if: steps.changes.outputs.ratchet_changed == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Cache node_modules
+        if: steps.changes.outputs.ratchet_changed == 'true'
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+
+      - name: Install dependencies
+        if: steps.changes.outputs.ratchet_changed == 'true' && steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Run ratchet tests
+        if: steps.changes.outputs.ratchet_changed == 'true'
+        run: npx vitest run tests/test_cloudflare/migration-integrity.test.ts tests/test_cloudflare/schema-validation.test.ts tests/test_agent/ratchet-tests-workflow.test.ts --maxWorkers=2
+
+      - name: Skip ratchet tests when irrelevant
+        if: steps.changes.outputs.ratchet_changed != 'true'
+        run: echo "No ratchet-relevant changes detected; ratchet tests skipped."

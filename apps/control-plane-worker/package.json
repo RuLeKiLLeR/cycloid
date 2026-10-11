@@ -1,0 +1,16 @@
+{
+  "name": "@cycloid/control-plane-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@octokit/auth-app": "^8.2.0",
+    "@octokit/rest": "^22.0.1",
+    "@sentry/cloudflare": "^10.42.0",
+    "aws4fetch": "^1.0.20",
+    "e2b": "^2.32.0"
+  }
+}

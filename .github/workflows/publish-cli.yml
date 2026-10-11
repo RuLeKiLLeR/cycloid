@@ -1,0 +1,179 @@
+name: Publish CLI to npm
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/cli/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/publish-cli.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-24.04-arm
+    concurrency:
+      group: publish-cli
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Resolve version
+        id: version-check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          LOCAL_VERSION=$(node -p "require('./apps/cli/package.json').version")
+          PUBLISHED_VERSION=$(node <<'NODE'
+          const { spawnSync } = require('node:child_process');
+
+          const result = spawnSync('npm', ['view', '@trycycloid/cli', 'version', '--json'], {
+            encoding: 'utf8',
+          });
+          const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
+
+          if (result.status === 0) {
+            const parsed = JSON.parse(result.stdout.trim());
+            process.stdout.write(Array.isArray(parsed) ? parsed.at(-1) : parsed);
+            process.exit(0);
+          }
+
+          if (/E404|404 Not Found|is not in this registry/i.test(output)) {
+            process.stdout.write('0.0.0');
+            process.exit(0);
+          }
+
+          process.stderr.write(output || 'npm view failed without output');
+          process.exit(result.status || 1);
+          NODE
+          )
+
+          if [ "$LOCAL_VERSION" != "$PUBLISHED_VERSION" ]; then
+            # Manual bump detected -- publish as-is
+            echo "version=$LOCAL_VERSION" >> "$GITHUB_OUTPUT"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "Publishing manually bumped $LOCAL_VERSION (was $PUBLISHED_VERSION)"
+          else
+            # Auto-bump patch version
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$PUBLISHED_VERSION"
+            NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+            node -e "
+              const fs = require('fs');
+              const path = './apps/cli/package.json';
+              const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+              pkg.version = '${NEW_VERSION}';
+              fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            "
+            npm install --package-lock-only --workspace @trycycloid/cli
+            echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "Auto-bumping $PUBLISHED_VERSION -> $NEW_VERSION"
+          fi
+      - name: Commit version bump
+        id: commit-version-bump
+        if: steps.version-check.outputs.bumped == 'true'
+        run: |
+          BASE_SHA=$(git rev-parse HEAD)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/cli/package.json package-lock.json
+          git commit -m "chore(cli): bump to v${{ steps.version-check.outputs.version }} [skip ci]"
+
+          PUSH_STDERR=$(mktemp)
+          if git push 2>"$PUSH_STDERR"; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PUSH_STATUS=$?
+          REMOTE_SHA=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+          if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$BASE_SHA" ] && grep -Eqi 'fetch first|non-fast-forward|failed to push some refs' "$PUSH_STDERR"; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping CLI publish because main advanced from $BASE_SHA to $REMOTE_SHA before the version bump could be pushed."
+            cat "$PUSH_STDERR" >&2
+            exit 0
+          fi
+
+          cat "$PUSH_STDERR" >&2
+          exit "$PUSH_STATUS"
+      - name: Publish skipped
+        if: steps.commit-version-bump.outputs.skipped == 'true'
+        run: echo "CLI publish skipped because main advanced before the auto-bump commit could be pushed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Install dependencies
+        if: steps.commit-version-bump.outputs.skipped != 'true'
+        run: npm ci
+      - name: Verify version is unpublished
+        if: steps.commit-version-bump.outputs.skipped != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./apps/cli/package.json').version")
+          PACKAGE_VERSION="@trycycloid/cli@$VERSION"
+          TMP_STDOUT=$(mktemp)
+          TMP_STDERR=$(mktemp)
+
+          if npm view "$PACKAGE_VERSION" version --json >"$TMP_STDOUT" 2>"$TMP_STDERR"; then
+            echo "Refusing to publish existing npm version: $PACKAGE_VERSION" >&2
+            cat "$TMP_STDOUT" >&2
+            exit 1
+          fi
+
+          if grep -Eqi 'E404|404 Not Found|is not in this registry' "$TMP_STDERR"; then
+            exit 0
+          fi
+
+          cat "$TMP_STDERR" >&2
+          exit 1
+      - name: Publish to npm
+        if: steps.commit-version-bump.outputs.skipped != 'true'
+        run: npm publish --access public
+        working-directory: apps/cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Notify Slack
+        if: "!cancelled() && steps.commit-version-bump.outputs.skipped != 'true'"
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+          SERVICE_NAME: "CLI"
+          VERSION: ${{ steps.version-check.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          if [ "$JOB_STATUS" = "success" ]; then
+            EMOJI=":white_check_mark:"
+            STATUS="succeeded"
+          else
+            EMOJI=":x:"
+            STATUS="failed"
+          fi
+          SHORT_SHA="${SHA::7}"
+          if [ "$JOB_STATUS" != "success" ]; then
+            RUN_LINK=" | <${RUN_URL}|View run>"
+            MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          else
+            RUN_LINK=""
+            MENTION=""
+          fi
+          PAYLOAD=$(jq -n --arg text "${EMOJI} *${SERVICE_NAME} v${VERSION} publish ${STATUS}*
+          <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> by ${ACTOR}${RUN_LINK}${MENTION}" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"

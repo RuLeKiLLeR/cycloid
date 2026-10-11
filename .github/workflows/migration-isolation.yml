@@ -1,0 +1,131 @@
+name: Migration isolation
+
+on:
+  pull_request:
+    branches: [main]
+    # Include label events so toggling `migration-with-code` re-evaluates the
+    # check without needing an extra push.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  migration-isolation:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Ensure migration PRs contain only migration files
+        id: migration_check
+        run: |
+          MIGRATION_DIRS=(
+            "apps/control-plane-worker/migrations/"
+            "drizzle/"
+          )
+
+          HEAD=${{ github.event.pull_request.head.sha }}
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          BASE=$(git merge-base origin/${{ github.event.pull_request.base.ref }} "$HEAD")
+
+          CHANGED_FILES=$(git diff --name-only "$BASE" "$HEAD")
+
+          HAS_SQL_MIGRATION=false
+          for dir in "${MIGRATION_DIRS[@]}"; do
+            if echo "$CHANGED_FILES" | grep -q "^${dir}.*\.sql$"; then
+              HAS_SQL_MIGRATION=true
+              break
+            fi
+          done
+
+          echo "has_sql_migration=$HAS_SQL_MIGRATION" >> "$GITHUB_OUTPUT"
+
+          if [ "$HAS_SQL_MIGRATION" = "false" ]; then
+            echo "No migration files in this PR -- skipping check."
+            exit 0
+          fi
+
+          NON_ADDED_MIGRATIONS=$(git diff --name-status "$BASE" "$HEAD" -- 'apps/control-plane-worker/migrations/*.sql' 'drizzle/*.sql' 'drizzle/**/*.sql' \
+            | awk '$1 != "A" { print }')
+
+          if [ -n "$NON_ADDED_MIGRATIONS" ]; then
+            echo "::error::Existing migrations are immutable after merge. Write a new forward migration instead of modifying, deleting, or renaming an existing SQL migration:"
+            echo "$NON_ADDED_MIGRATIONS"
+            exit 1
+          fi
+
+          ALLOW_MIGRATION_WITH_CODE="${{ contains(github.event.pull_request.labels.*.name, 'migration-with-code') }}"
+
+          # Filter out migration files and common non-code files that are OK to include
+          OTHER_FILES=$(echo "$CHANGED_FILES" | grep -v -E "^(apps/control-plane-worker/migrations/|drizzle/)" | grep -v -E '\.md$' || true)
+
+          if [ -n "$OTHER_FILES" ]; then
+            if [ "$ALLOW_MIGRATION_WITH_CODE" = "true" ]; then
+              echo "::warning::Migration PR includes code changes under explicit migration-with-code label:"
+              echo "$OTHER_FILES"
+              echo ""
+              echo "Continuing because the repo allows strictly additive, deploy-safe migrations with dependent app code."
+              echo "Migrations will still be validated below."
+              exit 0
+            fi
+            echo "::error::Migration PRs must only contain migration files. Found other changes:"
+            echo "$OTHER_FILES"
+            echo ""
+            echo "Split the migration into its own PR and merge it first, or add the migration-with-code label only for strictly additive, deploy-safe migrations with dependent app code."
+            exit 1
+          fi
+
+          echo "Migration-only PR -- check passed."
+
+      - uses: actions/setup-node@v6
+        if: steps.migration_check.outputs.has_sql_migration == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Cache node_modules
+        if: steps.migration_check.outputs.has_sql_migration == 'true'
+        id: cache-nm
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          # v3 cold-fills native modules after moving Backend Tests to arm-4core.
+          key: node-modules-v3-${{ runner.os }}-${{ runner.arch }}-node22-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+
+      - name: Install dependencies
+        if: steps.migration_check.outputs.has_sql_migration == 'true' && steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Merge PR head with latest target branch before validation
+        if: steps.migration_check.outputs.has_sql_migration == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git checkout --detach ${{ github.event.pull_request.head.sha }}
+          git merge --no-edit --no-commit origin/${{ github.event.pull_request.base.ref }}
+
+      # migration-integrity.test.ts already enforces unique numeric prefixes (and
+      # sequential numbering / no explicit transactions), but it scans the filesystem
+      # and has no import edge to the .sql files, so `vitest --changed` in
+      # backend-tests.yml never selects it on a migration PR. Force-run it here -- the
+      # same pattern frontend-build.yml uses for frontend-audit.test.ts.
+      - name: Check migration integrity (unique prefixes, sequential numbering)
+        if: steps.migration_check.outputs.has_sql_migration == 'true'
+        run: npx vitest run tests/test_cloudflare/migration-integrity.test.ts
+
+      - name: Validate migrations apply from empty local D1
+        if: steps.migration_check.outputs.has_sql_migration == 'true'
+        run: |
+          EMPTY_D1_DIR="$RUNNER_TEMP/d1-migration-validation"
+          rm -rf "$EMPTY_D1_DIR"
+          mkdir -p "$EMPTY_D1_DIR"
+
+          NPM_CONFIG_YES=true npm run db:migrate:local -- --persist-to "$EMPTY_D1_DIR"

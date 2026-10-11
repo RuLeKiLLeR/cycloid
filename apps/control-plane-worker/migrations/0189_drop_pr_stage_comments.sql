@@ -1,0 +1,12 @@
+-- ARC-1290: drop the orphaned pr_stage_comments table.
+-- Created by 0186 for #5265's per-PR stage *comment*, which was reverted by
+-- #5270. Migrations are forward-only, so #5270 only removed the comment-posting
+-- code (and #5271 had to restore the already-applied 0186) -- the table itself
+-- lingered in prod. The re-land (ARC-1271) renders the stage region inside the
+-- PR body and persists to a different table, pr_stage_regions (0188); nothing
+-- reads or writes pr_stage_comments anymore.
+-- Destructive-change exception:
+-- proven zero readers/writers in code, status-comment data with no value to
+-- preserve. SQLite drops the table's indices automatically. Do not edit the
+-- creating migration (0186) -- it is deployed.
+DROP TABLE IF EXISTS pr_stage_comments;

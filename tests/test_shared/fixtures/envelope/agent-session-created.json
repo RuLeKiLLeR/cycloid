@@ -1,0 +1,18 @@
+{
+  "phase": "agent.session.create",
+  "timestampMs": 1760000000200,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "status": "complete",
+    "agentSessionId": "agent-session-1",
+    "agentRuntimeBackend": "codex",
+    "agent": "codex",
+    "bridgeEventType": "agent_session_created",
+    "bridgeData": {
+      "agentSessionId": "agent-session-1",
+      "provider": "codex"
+    }
+  }
+}

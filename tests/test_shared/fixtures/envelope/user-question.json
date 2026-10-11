@@ -1,0 +1,22 @@
+{
+  "phase": "user_question",
+  "timestampMs": 1760000000550,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "questionId": "question-1",
+    "question": "Which environment should receive the smoke test?",
+    "options": [
+      {
+        "label": "QA",
+        "description": "Use the pre-prod worker."
+      },
+      "Local"
+    ],
+    "bridgeEventType": "question",
+    "bridgeData": {
+      "answer": null
+    }
+  }
+}

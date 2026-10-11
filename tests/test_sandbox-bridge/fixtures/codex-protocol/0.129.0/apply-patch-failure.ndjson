@@ -1,0 +1,13 @@
+{"method":"thread/started","params":{"thread":{"id":"thread-2"}}}
+{"method":"turn/started","params":{"threadId":"thread-2","turn":{"id":"turn-2"}}}
+{"method":"item/started","params":{"item":{"type":"userMessage","id":"user-2"},"threadId":"thread-2","turnId":"turn-2"}}
+{"method":"item/completed","params":{"item":{"type":"userMessage","id":"user-2"},"threadId":"thread-2","turnId":"turn-2"}}
+{"method":"item/started","params":{"item":{"type":"reasoning","id":"reason-1","summary":[],"content":[]},"threadId":"thread-2","turnId":"turn-2"}}
+{"method":"item/completed","params":{"item":{"type":"reasoning","id":"reason-1","summary":[],"content":[]},"threadId":"thread-2","turnId":"turn-2"}}
+{"method":"item/started","params":{"item":{"type":"agentMessage","id":"agent-2","text":"","phase":"commentary"},"threadId":"thread-2","turnId":"turn-2"}}
+{"method":"item/agentMessage/delta","params":{"threadId":"thread-2","turnId":"turn-2","itemId":"agent-2","delta":"Trying the exact patch."}}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"agent-2","text":"Trying the exact patch.","phase":"commentary"},"threadId":"thread-2","turnId":"turn-2"}}
+{"method":"warning","params":{"threadId":"thread-2","message":"apply_patch may fail"}}
+{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","planType":"pro"}}}
+{"method":"error","params":{"error":{"message":"Codex app-server error","codexErrorInfo":"other","additionalDetails":null},"threadId":"thread-2","turnId":"turn-2"}}
+{"method":"turn/completed","params":{"threadId":"thread-2","turn":{"id":"turn-2","status":"failed","error":{"message":"Codex app-server error"}}}}

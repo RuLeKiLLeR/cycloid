@@ -1,0 +1,12 @@
+-- Per-rule agent model for scheduled automations.
+--
+-- NULL keeps the backend default (gpt-5.4 / codex). A Claude model id such as
+-- `claude-opus-4-8` routes the scheduled session to the claude_code backend
+-- automatically: the scheduler passes model_id through to createSessionState,
+-- which derives agent_runtime_backend from the model via
+-- getAgentRuntimeBackendForModel. Mirrors automation_rules.model_id (migration
+-- 0229 for the Slack-alert event path).
+--
+-- Additive + nullable: deploy-safe with the dependent DAO/service/scheduler code
+-- (hence the migration-with-code label on this PR).
+ALTER TABLE scheduled_rules ADD COLUMN model_id TEXT;

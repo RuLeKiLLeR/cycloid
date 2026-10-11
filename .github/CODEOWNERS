@@ -1,0 +1,12 @@
+# CODEOWNERS for trycycloid/cycloid
+#
+# GitHub auto-requests every listed owner *except the PR author* when matching
+# files change, so do not put the whole team on a catch-all rule here.
+#
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+#
+# To make Code Owner review *required* (not just auto-requested), enable
+# "Require review from Code Owners" on the `Protect main` ruleset.
+
+# Default PR reviewer requests are assigned one-at-a-time by
+# .github/workflows/request-reviewer.yml.

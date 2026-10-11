@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reconcile Cycloid Memory PRs"
+  short_description: "Score, merge, or close Cycloid memory PRs"
+  default_prompt: "Use $reconcile-cycloid-memory-prs to process all open Cycloid memory PRs in this repo by scoring each proposed memory, merging worthwhile ones, and closing low-value ones with rationale."

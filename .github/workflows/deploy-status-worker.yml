@@ -1,0 +1,91 @@
+name: Deploy Status Worker
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/status-worker/**"
+      - "tests/test_status-worker/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - ".github/workflows/deploy-status-worker.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/status-worker/**"
+      - "tests/test_status-worker/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - ".github/workflows/deploy-status-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-status-worker
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: Typecheck and test
+        run: |
+          npm run -w @cycloid/status-worker typecheck
+          npx vitest run tests/test_status-worker
+          npx vitest run tests/test_agent/status-worker-deploy-workflow.test.ts
+      - name: Wrangler dry-run
+        run: npx wrangler deploy --env="" --dry-run --outdir /tmp/status-bundle
+        working-directory: apps/status-worker
+
+  deploy:
+    name: Deploy
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: Deploy worker
+        run: npx wrangler deploy --env=""
+        working-directory: apps/status-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Smoke status page
+        run: |
+          if ! getent hosts status.trycycloid.com >/dev/null; then
+            echo "status.trycycloid.com is not routed yet; skipping public smoke until the infra custom-domain PR lands."
+            exit 0
+          fi
+          curl -sfS https://status.trycycloid.com/ >/tmp/status-page.html
+          curl -sfS https://status.trycycloid.com/api/status >/tmp/status.json
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const body = JSON.parse(readFileSync("/tmp/status.json", "utf8"));
+          if ((body.state !== "up" && body.state !== "down") || typeof body.message !== "string") {
+            throw new Error(`Invalid status JSON: ${JSON.stringify(body)}`);
+          }
+          if (body.updatedAt !== null && typeof body.updatedAt !== "number") {
+            throw new Error(`Invalid updatedAt: ${JSON.stringify(body.updatedAt)}`);
+          }
+          NODE

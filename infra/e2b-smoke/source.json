@@ -1,0 +1,5 @@
+{
+  "repository": "trycycloid/infra",
+  "ref": "9457eee86fda25da873ca7542aee144e2ccad122",
+  "providerAwsPath": "iac/provider-aws"
+}

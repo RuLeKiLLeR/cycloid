@@ -1,0 +1,648 @@
+name: Deploy Control Plane Core
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy
+        required: true
+        type: string
+      environment:
+        description: "Target deploy environment: production or qa"
+        required: true
+        type: string
+      force_deploy:
+        description: Bypass production bundle-hash deploy gate
+        required: false
+        type: boolean
+        default: false
+      sync_secrets:
+        description: Sync SSM secrets before deploying
+        required: false
+        type: boolean
+        default: false
+      wait_for_tfc:
+        description: Wait for Terraform Cloud before syncing secrets
+        required: false
+        type: boolean
+        default: false
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+jobs:
+  deploy-control-plane:
+    name: Deploy Control Plane
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write
+      statuses: read
+    concurrency:
+      group: ${{ inputs.environment == 'qa' && 'qa-deploy' || 'deploy-control-plane' }}
+      cancel-in-progress: false
+    env:
+      GATE_NAMESPACE_ID: 05e778d4f6a245b196753cc5fdc56385
+      GATE_KEY: deploy-gate:last-deployed-bundle-hash
+      SECRET_FINGERPRINT_KEY: deploy-gate:last-synced-secret-fingerprints
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Resolve deployed SHA
+        id: deployed_sha
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "DEPLOY_SHA=$sha" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Restore node_modules cache
+        id: node-modules-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          key: ${{ runner.os }}-${{ runner.arch }}-node-22-node-modules-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+      - name: Install worker dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Compute bundle hash
+        id: bundle
+        working-directory: apps/control-plane-worker
+        run: |
+          npx wrangler deploy --env="" --dry-run --outdir /tmp/bundle-gate
+          HASH="$(node ../../scripts/control-plane-bundle-hash.mjs /tmp/bundle-gate/index.js wrangler.toml)"
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "Bundle hash: $HASH"
+        if: ${{ inputs.environment == 'production' }}
+      - name: Bundle-hash deploy gate
+        id: gate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BUNDLE_HASH: ${{ steps.bundle.outputs.hash }}
+        run: |
+          if [ "${{ inputs.force_deploy }}" = "true" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Worker deploy: forced (force_deploy bypasses the bundle-hash gate)." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Fail open: a missing key (first run) or KV read failure (e.g. the
+          # token lacks KV scope) must deploy, never silently skip.
+          LAST_HASH="$(npx wrangler kv key get "$GATE_KEY" --remote --text --namespace-id "$GATE_NAMESPACE_ID" 2>/dev/null || true)"
+          if [ -z "$LAST_HASH" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Worker deploy: proceeding (no stored bundle hash: first run or KV read failure; failing open)." | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "$LAST_HASH" = "$BUNDLE_HASH" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Worker code deploy: skipped (bundle hash unchanged: $BUNDLE_HASH); secret reconciliation is evaluated separately." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Worker deploy: proceeding (bundle hash changed: $LAST_HASH -> $BUNDLE_HASH)." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+        if: ${{ inputs.environment == 'production' }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/cycloid-github-actions-prod
+          aws-region: us-east-1
+        if: ${{ inputs.environment == 'production' }}
+      - name: Resolve SSM sync inputs
+        id: ssm
+        if: ${{ inputs.environment == 'production' }}
+        run: |-
+          echo "changed=${{ inputs.sync_secrets }}" >> "$GITHUB_OUTPUT"
+          echo "wait_for_tfc=${{ inputs.sync_secrets == true && inputs.wait_for_tfc == true }}" >> "$GITHUB_OUTPUT"
+      - name: Wait for Terraform Cloud SSM apply
+        if: ${{ inputs.environment == 'production' && steps.ssm.outputs.wait_for_tfc == 'true' }}
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const sha = context.sha;
+
+            const deadline = Date.now() + 15 * 60 * 1000;
+            while (Date.now() < deadline) {
+              const { data: statuses } = await github.rest.repos.listCommitStatusesForRef({
+                owner,
+                repo,
+                ref: sha,
+                per_page: 100,
+              });
+              const terraformCloud = statuses.find((status) =>
+                status.context.startsWith("Terraform Cloud/cycloid/"),
+              );
+              if (!terraformCloud) {
+                core.info("Waiting for Terraform Cloud status to appear...");
+              } else if (terraformCloud.state === "success") {
+                core.info(`Terraform Cloud completed: ${terraformCloud.description || terraformCloud.target_url}`);
+                return;
+              } else if (terraformCloud.state === "failure" || terraformCloud.state === "error") {
+                core.setFailed(`Terraform Cloud failed before secret sync: ${terraformCloud.target_url}`);
+                return;
+              } else {
+                core.info(`Terraform Cloud is ${terraformCloud.state}; waiting before secret sync...`);
+              }
+              await new Promise((resolve) => setTimeout(resolve, 15000));
+            }
+            core.setFailed("Timed out waiting for Terraform Cloud to apply infra/ssm.tf before secret sync.");
+      - name: Ensure Cloudflare Queues exist
+        run: |
+          bash scripts/ensure-cloudflare-queues.sh \
+            cycloid-traces \
+            cycloid-traces-dlq \
+            cycloid-memory-analysis \
+            cycloid-memory-refine \
+            cycloid-memory-refine-dlq \
+            cycloid-sandbox-layer-builds
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'production' }}
+      # The worker binds BRIDGE_BUNDLES; wrangler deploy fails if the bucket does not
+      # exist yet, and the sandbox job's ensure step runs independently of this one.
+      - name: Ensure Cloudflare R2 buckets exist
+        run: |
+          # Manual deploys check out inputs.ref, which can predate this script
+          # (e.g. an incident rollback). Skip rather than fail — the bucket is
+          # durable once created, so older refs stay deployable.
+          if [ -f scripts/ensure-cloudflare-r2-buckets.sh ]; then
+            bash scripts/ensure-cloudflare-r2-buckets.sh cycloid-bridge-bundles
+          else
+            echo "scripts/ensure-cloudflare-r2-buckets.sh absent in this ref; skipping R2 bucket ensure."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'production' }}
+      - name: Verify bound Vectorize indexes exist
+        run: |
+          # Manual deploys check out inputs.ref, which can predate this script
+          # (e.g. an incident rollback to an older commit). Skip rather than
+          # fail with "No such file" so older refs stay deployable; the
+          # preflight still runs for current and future deploys.
+          if [ -f scripts/preflight-vectorize-indexes.sh ]; then
+            bash scripts/preflight-vectorize-indexes.sh apps/control-plane-worker/wrangler.toml
+          else
+            echo "scripts/preflight-vectorize-indexes.sh absent in this ref; skipping Vectorize preflight."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'production' }}
+      - name: Prepare production secret reconciliation
+        id: prod_secrets
+        if: ${{ inputs.environment == 'production' && steps.ssm.outputs.changed == 'true' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          aws ssm get-parameters-by-path \
+            --path "/cycloid/" \
+            --with-decryption \
+            --query "Parameters[].{Name:Name,Value:Value,Version:Version,LastModifiedDate:LastModifiedDate}" \
+            --output json \
+            > /tmp/control-plane-ssm.json
+          node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync("/tmp/control-plane-ssm.json","utf8")); const e=new Set(["CONTROL_PLANE_URL","JIRA_OAUTH_CALLBACK_URL","LINEAR_OAUTH_CALLBACK_URL","NOTION_OAUTH_CALLBACK_URL","SLACK_OAUTH_CALLBACK_URL","SLACK_INSTALL_CALLBACK_URL","OTEL_COLLECTOR_URL","COLLECTOR_AUTH_KEY"]); const s=Object.fromEntries(p.map(x=>[x.Name.split("/").pop(),x.Value]).filter(([k])=>/^[A-Z][A-Z0-9_]*$/.test(k)&&!e.has(k))); fs.writeFileSync("/tmp/control-plane-secrets.json",JSON.stringify(s),{mode:0o600})'
+          # These keys are wrangler-owned public bindings and must not collide with Cloudflare binding names.
+          npx wrangler secret list --name cycloid-control-plane-production --format json > /tmp/control-plane-provider-secrets.json
+          npx wrangler kv key get "$SECRET_FINGERPRINT_KEY" --remote --text --namespace-id "$GATE_NAMESPACE_ID" > /tmp/control-plane-fingerprints.json || echo '{}' > /tmp/control-plane-fingerprints.json
+          node scripts/reconcile-control-plane-secrets.mjs \
+            --environment=production \
+            --worker=cycloid-control-plane-production \
+            --ssm=/tmp/control-plane-ssm.json \
+            --secrets=/tmp/control-plane-secrets.json \
+            --provider-names=/tmp/control-plane-provider-secrets.json \
+            --fingerprints=/tmp/control-plane-fingerprints.json \
+            --output=/tmp/control-plane-reconciliation.json
+          node scripts/validate-control-plane-secrets.mjs /tmp/control-plane-secrets.json --env=production
+          CHANGED=$(node -e 'console.log(require("/tmp/control-plane-reconciliation.json").secretsChangedCount)')
+          node -e 'const fs=require("fs"); const r=require("/tmp/control-plane-reconciliation.json"); fs.writeFileSync("/tmp/control-plane-changed-secrets.json",JSON.stringify(r.changedSecrets),{mode:0o600}); console.log(`changed=${r.changedKeys.join(",")||"none"} removed=${r.removedKeys.join(",")||"none"}`)'
+          echo "changed=$([ "$CHANGED" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "secrets_changed_count=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "removed_keys=$(node -e 'process.stdout.write(require("/tmp/control-plane-reconciliation.json").removedKeys.join(","))')" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      # Runs on EVERY prod deploy, not just secret-sync deploys. The full validation
+      # above only runs when infra/ssm.tf changed (sync_secrets=true); an app/workflow-
+      # only deploy that enables Freestyle routing would otherwise skip it and ship a
+      # missing/CHANGE_ME FREESTYLE_API_KEY green, failing every routed session at spawn.
+      # The script fetches via the SSM path-read the prod OIDC role is granted (NOT the
+      # denied singular get-parameter that broke #6995 — see ARC-1492) and NEVER blocks
+      # the deploy on a fetch error; it fails closed only on a successful read that shows
+      # the key definitively missing/placeholder while routing is on. AWS creds are
+      # configured job-level above.
+      - name: Assert Freestyle key when routing is enabled
+        if: ${{ inputs.environment == 'production' }}
+        run: node scripts/assert-freestyle-key.mjs --env=production
+      - name: Check migration integrity before D1 apply
+        if: ${{ inputs.environment == 'production' }}
+        run: |
+          if [ ! -f tests/test_cloudflare/migration-integrity.test.ts ]; then
+            echo "migration-integrity.test.ts is absent in this checked-out ref; skipping rollback-compatible guard."
+            exit 0
+          fi
+          npx vitest run tests/test_cloudflare/migration-integrity.test.ts
+      - name: Run D1 migrations
+        run: npx wrangler d1 migrations apply cycloid-control-plane-production --remote --env=""
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        if: ${{ inputs.environment == 'production' }}
+      - name: Upload production candidate Worker version
+        id: prod_candidate
+        if: ${{ inputs.environment == 'production' && (steps.gate.outputs.deploy == 'true' || steps.prod_secrets.outputs.changed == 'true') }}
+        run: |
+          set -euo pipefail
+          args=(versions upload --env="" --var "SENTRY_RELEASE:$DEPLOY_SHA")
+          if [ "${{ steps.prod_secrets.outputs.changed || 'false' }}" = "true" ]; then args+=(--secrets-file /tmp/control-plane-changed-secrets.json); fi
+          # `versions upload` has no --json flag (wrangler rejects it with "Unknown argument: json").
+          # Its machine-readable output comes via WRANGLER_OUTPUT_FILE_PATH as NDJSON; the shared
+          # parser (scripts/extract-wrangler-version-id.mjs) reads the version-upload record for the
+          # version id and fails closed if none is present.
+          rm -f /tmp/control-plane-candidate.json
+          WRANGLER_OUTPUT_FILE_PATH=/tmp/control-plane-candidate.json npx wrangler "${args[@]}"
+          VERSION_ID=$(node ../../scripts/extract-wrangler-version-id.mjs /tmp/control-plane-candidate.json)
+          echo "version_id=$VERSION_ID" >> "$GITHUB_OUTPUT"
+          echo "candidate_versions_created=1" >> "$GITHUB_OUTPUT"
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Deploy production candidate traffic
+        id: prod_traffic
+        if: ${{ inputs.environment == 'production' && steps.prod_candidate.outputs.version_id != '' }}
+        run: |
+          set -euo pipefail
+          # `versions deploy` has no --json flag (wrangler rejects it with "Unknown argument: json").
+          npx wrangler versions deploy "${{ steps.prod_candidate.outputs.version_id }}" --yes > /tmp/control-plane-traffic-deploy.json
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+          echo "traffic_deployments_applied=1" >> "$GITHUB_OUTPUT"
+          if [ -f /tmp/control-plane-reconciliation.json ]; then
+            node -e 'const fs=require("fs"); const r=require("/tmp/control-plane-reconciliation.json"); fs.writeFileSync("/tmp/control-plane-fingerprints-next.json",JSON.stringify(r.fingerprints),{mode:0o600})'
+            npx wrangler kv key put "$SECRET_FINGERPRINT_KEY" "$(cat /tmp/control-plane-fingerprints-next.json)" --remote --namespace-id "$GATE_NAMESPACE_ID"
+          fi
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Verify deployed schema version
+        run: |
+          set -euo pipefail
+          TOKEN="$(aws ssm get-parameter --name /cycloid/CI_AUTOMATION_TOKEN --with-decryption \
+            --query 'Parameter.Value' --output text 2>/dev/null || true)"
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "None" ]; then
+            # The prod deploy role may only have path-level access (matches the
+            # secret-sync step); fall back to the path read.
+            TOKEN="$(aws ssm get-parameters-by-path --path /cycloid/ --with-decryption \
+              --query "Parameters[?Name=='/cycloid/CI_AUTOMATION_TOKEN'].Value" --output text)"
+          fi
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "None" ]; then
+            echo "::error::CI_AUTOMATION_TOKEN unavailable from SSM"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+
+          # -S keeps curl errors visible despite -s; --retry-all-errors makes
+          # the retries cover transient 5xx responses, not just transport
+          # failures (with -f alone, HTTP errors skip the retry loop).
+          RESPONSE="$(curl -sfS --max-time 30 --retry 3 --retry-delay 5 --retry-all-errors \
+            -H "Authorization: Bearer $TOKEN" \
+            https://api.trycycloid.com/api/health/schema)"
+
+          # d1_migrations records names as the path relative to migrations_dir
+          # (the .sql-suffixed filename); the suffix-normalized compare below is
+          # belt-and-suspenders against wrangler-version drift.
+          # (.appliedNames // []) keeps jq exit 0 on an error body so the
+          # mismatch branch below reports the diff instead of dying silently.
+          APPLIED="$(echo "$RESPONSE" | jq -r '(.appliedNames // []) | .[]' | sed 's/\.sql$//' | sort)"
+          EXPECTED="$(for f in apps/control-plane-worker/migrations/*.sql; do basename "$f"; done | sed 's/\.sql$//' | sort)"
+          if [ "$APPLIED" != "$EXPECTED" ]; then
+            echo "::error::Deployed schema does not match repo migrations"
+            diff <(echo "$EXPECTED") <(echo "$APPLIED") || true
+            exit 1
+          fi
+          echo "Schema check passed: $(echo "$EXPECTED" | wc -l | tr -d ' ') migrations applied."
+        if: ${{ inputs.environment == 'production' }}
+      - name: Record deployed bundle hash
+        if: ${{ inputs.environment == 'production' && steps.gate.outputs.deploy == 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BUNDLE_HASH: ${{ steps.bundle.outputs.hash }}
+        run: npx wrangler kv key put "$GATE_KEY" "$BUNDLE_HASH" --remote --namespace-id "$GATE_NAMESPACE_ID"
+      - name: Report production versioned deploy accounting
+        if: ${{ always() && inputs.environment == 'production' }}
+        env:
+          CANDIDATE: ${{ steps.prod_candidate.outputs.version_id }}
+          SECRET_COUNT: ${{ steps.prod_secrets.outputs.secrets_changed_count || '0' }}
+          TRAFFIC: ${{ steps.prod_traffic.outputs.applied || 'false' }}
+        run: |
+          {
+            echo "## Control-plane versioned deploy"
+            echo "- candidate_versions_created: ${CANDIDATE:+1}${CANDIDATE:-0}"
+            echo "- traffic_deployments_applied: ${TRAFFIC}"
+            echo "- code_changed: ${{ steps.gate.outputs.deploy }}"
+            echo "- secrets_changed_count: ${SECRET_COUNT}"
+            echo "- deployed_version_id: ${CANDIDATE:-none}"
+            if [ "$CANDIDATE" != "" ] && [ "$TRAFFIC" != "true" ]; then echo "- outcome: upload-succeeded-but-deploy-failed or deploy was skipped"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove runner secret files
+        if: ${{ always() && inputs.environment == 'production' }}
+        run: rm -f /tmp/control-plane-{ssm,secrets,provider-secrets,fingerprints,reconciliation,changed-secrets,candidate,traffic-deploy,fingerprints-next}.json
+      - name: Notify Slack
+        if: ${{ inputs.environment == 'production' && !cancelled() && inputs.notify_slack != false }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ steps.deployed_sha.outputs.sha }}
+          REPO: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+          SERVICE_NAME: PROD API
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKER_DEPLOYED: ${{ steps.gate.outputs.deploy }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          if [ "$JOB_STATUS" = "success" ]; then
+            EMOJI=":white_check_mark:"
+            STATUS="succeeded"
+          else
+            EMOJI=":x:"
+            STATUS="failed"
+          fi
+          SKIP_SUFFIX=""
+          if [ "$WORKER_DEPLOYED" = "false" ]; then
+            SKIP_SUFFIX=" · worker skipped: bundle unchanged"
+          fi
+          SHORT_SHA="${SHA::7}"
+          SUBJECT="$(git log -1 --format=%s "$SHA" 2>/dev/null || true)"
+          if [ -z "$SUBJECT" ] && [ -n "$HEAD_COMMIT_MESSAGE" ]; then
+            SUBJECT="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          fi
+          SUBJECT="$(printf '%s' "$SUBJECT" | cut -c1-72)"
+          SUBJECT="$(printf '%s' "$SUBJECT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+          if [ "$JOB_STATUS" != "success" ]; then
+            MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          else
+            MENTION=""
+          fi
+          PAYLOAD=$(jq -n --arg text "${EMOJI} *deploy ${STATUS}* · ${SERVICE_NAME} · ${SUBJECT} · ${ACTOR} · <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> · <${RUN_URL}|run>${SKIP_SUFFIX}${MENTION}" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"
+      - name: Fail if wrangler.toml still has QA placeholder IDs
+        run: |
+          # Match only actual binding-id assignments, not the operator comment
+          # block that documents the placeholders.
+          pattern='^[[:space:]]*(database_id|id)[[:space:]]*=[[:space:]]*"REPLACE_WITH_QA_'
+          if grep -qE "$pattern" apps/control-plane-worker/wrangler.toml; then
+            echo "::error::wrangler.toml contains REPLACE_WITH_QA_* placeholders." \
+                 "Provision the QA D1/KV/queues and update wrangler.toml before deploying."
+            grep -nE "$pattern" apps/control-plane-worker/wrangler.toml
+            exit 1
+          fi
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Assert QA worker name
+        working-directory: apps/control-plane-worker
+        run: |
+          # Flag-based range: `awk '/^\[env\.qa\]/,/^\[env\./'` collapsed to a
+          # single line because the start and end patterns both matched the
+          # [env.qa] header. Toggle on [env.qa], toggle off at the next
+          # top-level [section] header, and capture the first `name = "…"`
+          # inside that window.
+          expected="cycloid-control-plane-qa"
+          actual=$(awk -F '"' '
+            /^\[env\.qa\]/ { in_section = 1; next }
+            /^\[/          { in_section = 0 }
+            in_section && /^name = / { print $2; exit }
+          ' wrangler.toml)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Expected [env.qa] name=$expected but got '$actual'"
+            exit 1
+          fi
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Verify bound Vectorize indexes exist
+        run: |
+          # Manual deploys check out inputs.ref, which can predate this script
+          # (e.g. an incident rollback to an older commit). Skip rather than
+          # fail with "No such file" so older refs stay deployable; the
+          # preflight still runs for current and future deploys.
+          if [ -f scripts/preflight-vectorize-indexes.sh ]; then
+            bash scripts/preflight-vectorize-indexes.sh apps/control-plane-worker/wrangler.toml qa
+          else
+            echo "scripts/preflight-vectorize-indexes.sh absent in this ref; skipping Vectorize preflight."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/cycloid-github-actions-qa
+          aws-region: us-east-1
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Prepare QA secret reconciliation
+        id: qa_secrets
+        if: ${{ inputs.environment == 'qa' && inputs.sync_secrets == true }}
+        run: |
+          set -euo pipefail
+          umask 077
+          aws ssm get-parameters-by-path \
+            --path "/cycloid/qa/" \
+            --with-decryption \
+            --query "Parameters[].{Name:Name,Value:Value,Version:Version,LastModifiedDate:LastModifiedDate}" \
+            --output json > /tmp/control-plane-ssm.json
+          node -e 'const fs=require("fs"); const p=JSON.parse(fs.readFileSync("/tmp/control-plane-ssm.json","utf8")); const e=new Set(["CONTROL_PLANE_URL","JIRA_OAUTH_CALLBACK_URL","LINEAR_OAUTH_CALLBACK_URL","NOTION_OAUTH_CALLBACK_URL","SLACK_OAUTH_CALLBACK_URL","SLACK_INSTALL_CALLBACK_URL"]); const s=Object.fromEntries(p.map(x=>[x.Name.split("/").pop(),x.Value]).filter(([k])=>/^[A-Z][A-Z0-9_]*$/.test(k)&&!e.has(k))); fs.writeFileSync("/tmp/control-plane-secrets.json",JSON.stringify(s),{mode:0o600})'
+          # These keys are wrangler-owned public bindings and must not collide with Cloudflare binding names.
+          # `secret list` targets the Worker by its literal deployed name via --name, so do NOT also pass
+          # --env qa: under wrangler's default legacy environments --env appends "-qa" to the --name value,
+          # producing the nonexistent worker "cycloid-control-plane-qa-qa". Mirror the prod command, which
+          # passes --name only.
+          npx wrangler secret list --name cycloid-control-plane-qa --format json > /tmp/control-plane-provider-secrets.json
+          npx wrangler kv key get "$SECRET_FINGERPRINT_KEY" --remote --text --namespace-id "$GATE_NAMESPACE_ID" --env qa > /tmp/control-plane-fingerprints.json || echo '{}' > /tmp/control-plane-fingerprints.json
+          node scripts/reconcile-control-plane-secrets.mjs --environment=qa --worker=cycloid-control-plane-qa --ssm=/tmp/control-plane-ssm.json --secrets=/tmp/control-plane-secrets.json --provider-names=/tmp/control-plane-provider-secrets.json --fingerprints=/tmp/control-plane-fingerprints.json --output=/tmp/control-plane-reconciliation.json
+          node scripts/validate-control-plane-secrets.mjs /tmp/control-plane-secrets.json --env=qa --oauth=github,linear,slack
+          CHANGED=$(node -e 'console.log(require("/tmp/control-plane-reconciliation.json").secretsChangedCount)')
+          node -e 'const fs=require("fs"); const r=require("/tmp/control-plane-reconciliation.json"); fs.writeFileSync("/tmp/control-plane-changed-secrets.json",JSON.stringify(r.changedSecrets),{mode:0o600}); console.log(`changed=${r.changedKeys.join(",")||"none"} removed=${r.removedKeys.join(",")||"none"}`)'
+          echo "changed=$([ "$CHANGED" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "secrets_changed_count=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "removed_keys=$(node -e 'process.stdout.write(require("/tmp/control-plane-reconciliation.json").removedKeys.join(","))')" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Check migration integrity before D1 apply (QA)
+        if: ${{ inputs.environment == 'qa' }}
+        run: |
+          if [ ! -f tests/test_cloudflare/migration-integrity.test.ts ]; then
+            echo "migration-integrity.test.ts is absent in this checked-out ref; skipping rollback-compatible guard."
+            exit 0
+          fi
+          npx vitest run tests/test_cloudflare/migration-integrity.test.ts
+      - name: Run D1 migrations (QA)
+        run: npx wrangler d1 migrations apply cycloid-control-plane-qa --remote --env qa
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Ensure QA Cloudflare Queues exist
+        run: |
+          bash scripts/ensure-cloudflare-queues.sh \
+            cycloid-traces-qa \
+            cycloid-traces-dlq-qa \
+            cycloid-memory-analysis-qa \
+            cycloid-memory-refine-qa \
+            cycloid-memory-refine-dlq-qa \
+            cycloid-sandbox-layer-builds-qa
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      # The worker binds BRIDGE_BUNDLES; wrangler deploy fails if the bucket does not
+      # exist yet, and the sandbox job's ensure step runs independently of this one.
+      - name: Ensure QA Cloudflare R2 buckets exist
+        run: |
+          # Same older-ref rollback guard as the production R2 ensure step.
+          if [ -f scripts/ensure-cloudflare-r2-buckets.sh ]; then
+            bash scripts/ensure-cloudflare-r2-buckets.sh cycloid-bridge-bundles-qa
+          else
+            echo "scripts/ensure-cloudflare-r2-buckets.sh absent in this ref; skipping R2 bucket ensure."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Upload QA candidate Worker version
+        id: qa_candidate
+        run: |
+          set -euo pipefail
+          args=(versions upload --env qa --var "SENTRY_RELEASE:$DEPLOY_SHA")
+          if [ "${{ steps.qa_secrets.outputs.changed || 'false' }}" = "true" ]; then args+=(--secrets-file /tmp/control-plane-changed-secrets.json); fi
+          # `versions upload` has no --json flag (wrangler rejects it with "Unknown argument: json").
+          # Its machine-readable output comes via WRANGLER_OUTPUT_FILE_PATH as NDJSON; the shared
+          # parser (scripts/extract-wrangler-version-id.mjs) reads the version-upload record for the
+          # version id and fails closed if none is present.
+          rm -f /tmp/control-plane-candidate.json
+          WRANGLER_OUTPUT_FILE_PATH=/tmp/control-plane-candidate.json npx wrangler "${args[@]}"
+          VERSION_ID=$(node ../../scripts/extract-wrangler-version-id.mjs /tmp/control-plane-candidate.json)
+          echo "version_id=$VERSION_ID" >> "$GITHUB_OUTPUT"
+          echo "candidate_versions_created=1" >> "$GITHUB_OUTPUT"
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Deploy QA candidate traffic
+        id: qa_traffic
+        run: |
+          set -euo pipefail
+          # `versions deploy` has no --json flag (wrangler rejects it with "Unknown argument: json").
+          npx wrangler versions deploy "${{ steps.qa_candidate.outputs.version_id }}" --env qa --yes > /tmp/control-plane-traffic-deploy.json
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+          echo "traffic_deployments_applied=1" >> "$GITHUB_OUTPUT"
+          if [ -f /tmp/control-plane-reconciliation.json ]; then
+            node -e 'const fs=require("fs"); const r=require("/tmp/control-plane-reconciliation.json"); fs.writeFileSync("/tmp/control-plane-fingerprints-next.json",JSON.stringify(r.fingerprints),{mode:0o600})'
+            npx wrangler kv key put "$SECRET_FINGERPRINT_KEY" "$(cat /tmp/control-plane-fingerprints-next.json)" --remote --namespace-id "$GATE_NAMESPACE_ID" --env qa
+          fi
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Report QA versioned deploy accounting
+        if: ${{ always() && inputs.environment == 'qa' }}
+        env:
+          CANDIDATE: ${{ steps.qa_candidate.outputs.version_id }}
+          SECRET_COUNT: ${{ steps.qa_secrets.outputs.secrets_changed_count || '0' }}
+          TRAFFIC: ${{ steps.qa_traffic.outputs.applied || 'false' }}
+        run: |
+          {
+            echo "## Control-plane versioned deploy"
+            echo "- candidate_versions_created: ${CANDIDATE:+1}${CANDIDATE:-0}"
+            echo "- traffic_deployments_applied: ${TRAFFIC}"
+            echo "- code_changed: true"
+            echo "- secrets_changed_count: ${SECRET_COUNT}"
+            echo "- deployed_version_id: ${CANDIDATE:-none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove QA runner secret files
+        if: ${{ always() && inputs.environment == 'qa' }}
+        run: rm -f /tmp/control-plane-{ssm,secrets,provider-secrets,fingerprints,reconciliation,changed-secrets,candidate,traffic-deploy,fingerprints-next}.json
+      - name: Verify deployed QA health
+        run: |
+          set -euo pipefail
+          RESPONSE="$(curl -sfS --max-time 30 --retry 3 --retry-delay 5 --retry-all-errors https://qa.trycycloid.com/api/health)"
+          RESPONSE="$RESPONSE" node -e "
+            let body;
+            try {
+              body = JSON.parse(process.env.RESPONSE);
+            } catch (error) {
+              console.error('QA health returned non-JSON response:');
+              console.error(process.env.RESPONSE);
+              process.exit(1);
+            }
+            if (body.ok) process.exit(0);
+            console.error('QA health failed: ' + JSON.stringify(body));
+            process.exit(1);
+          "
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Print deployed QA URL
+        run: |
+          echo "QA worker deployed from ${{ inputs.ref }} ($DEPLOY_SHA)"
+          echo "Health: https://qa.trycycloid.com/health"
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Notify Slack
+        if: ${{ inputs.environment == 'qa' && !cancelled() && inputs.notify_slack != false }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ env.DEPLOY_SHA || github.sha }}
+          REPO: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+          SERVICE_NAME: QA API
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          if [ "$JOB_STATUS" = "success" ]; then
+            EMOJI=":white_check_mark:"
+            STATUS="succeeded"
+          else
+            EMOJI=":x:"
+            STATUS="failed"
+          fi
+          SHORT_SHA="${SHA::7}"
+          SUBJECT="$(git log -1 --format=%s "$SHA" 2>/dev/null || true)"
+          if [ -z "$SUBJECT" ] && [ -n "$HEAD_COMMIT_MESSAGE" ]; then
+            SUBJECT="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          fi
+          SUBJECT="$(printf '%s' "$SUBJECT" | cut -c1-72)"
+          SUBJECT="$(printf '%s' "$SUBJECT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+          if [ "$JOB_STATUS" != "success" ]; then
+            MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          else
+            MENTION=""
+          fi
+          PAYLOAD=$(jq -n --arg text "${EMOJI} *deploy ${STATUS}* · ${SERVICE_NAME} · ${SUBJECT} · ${ACTOR} · <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> · <${RUN_URL}|run>${MENTION}" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"

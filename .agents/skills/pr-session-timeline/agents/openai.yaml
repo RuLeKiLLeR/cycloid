@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Session Timeline"
+  short_description: "Reconstruct stopwatch timelines for Cycloid sessions and PR review loops"
+  default_prompt: "Use $pr-session-timeline to reconstruct the stopwatch-style timeline for this Cycloid session or GitHub PR, including prompt start, publish, reviewer comments and edits, verification agent runs, review-loop work, pushes, and final state."

@@ -1,0 +1,942 @@
+@import "tailwindcss";
+
+/* Monochrome Control — Cycloid's design system. A calm control room, not a
+   chat toy. Strictly achromatic grayscale on a pure-black void, plus exactly
+   two hues: arcane violet ("live") reserved for liveness/focus/running states,
+   and error #ffb4ab reserved for blocked/failed. Elevation is tonal — a lighter
+   surface + a 1px border, never a drop shadow. Corners are 0px everywhere; sharp
+   90° angles are the brand signature. Geist carries ALL interface text; JetBrains
+   Mono is reserved for actual code and copyable technical strings. Token NAMES are held stable so
+   the ~50 component files using `bg-surface-1`, `text-text-muted`, `rounded-lg`,
+   `text-md`, etc. inherit the new look with no rewrite. Dark is the only theme;
+   the palette binds directly in @theme so first paint is always correct. */
+
+@import "@fontsource-variable/geist/wght.css";
+@import "@fontsource-variable/jetbrains-mono/wght.css";
+
+/* cache-bust: monochrome-control pass */
+:root {
+  --cache-bust: 4;
+}
+
+@theme {
+  /* Surfaces — tonal elevation. Pure-black void → lighter surfaces per level.
+     surface-0 page → surface-1 cards → surface-2 nested/hover → surface-3
+     popovers/modals. Depth comes from a 1px border at each step, not shadow. */
+  --color-surface-0: #000000; /* app base / page void */
+  --color-surface-1: #0a0a0a; /* cards, panels */
+  --color-surface-2: #141414; /* nested containers, hover rows */
+  --color-surface-3: #1c1c1c; /* popovers, modals */
+
+  /* Borders — 1px always, doing the work shadows would. `border` is the hairline
+     structure step; `border-strong` is interactive rest (inputs, buttons);
+     `border-hover` lightens one step on hover; `border-focus` flips to white. */
+  --color-border: #1f1f1f; /* hairline dividers, card edges (border-1) */
+  --color-border-strong: #333333; /* inputs, interactive rest (border-2) */
+  --color-border-hover: #4d4d4d; /* hover (border-3) */
+  --color-border-focus: #ffffff; /* focus + active */
+
+  /* Text — grayscale ramp. primary reading, secondary metadata, muted
+     tertiary/placeholder. */
+  --color-text-primary: #f5f5f5;
+  --color-text-secondary: #a3a3a3;
+  /* AA against surface-3, the lightest dark surface that carries muted copy. */
+  --color-text-muted: #858585;
+  --color-text-inverse: #0a0a0a; /* on white surfaces (primary buttons) */
+
+  /* Shadow channel — pure black. Only glows are used for elevation (see effects
+     utilities); this stays defined for any legacy consumer. */
+  --color-shadow-rgb: 0, 0, 0;
+
+  /* Accent = "ink" (white). It backs the primary button and primary text, so the
+     accent family stays achromatic. Soft/tinted steps are neutral gray washes so
+     badges/pills read as quiet UI, not a colorful brand thing. Differentiation
+     comes from weight, case, and spacing — not hue. Re-derived from the gray ramp
+     per the kit Button spec: primary bg = white, active = gray-9. */
+  --color-accent: #ffffff;
+  --color-accent-hover: #d6d6d6; /* gray-9 — primary active / hover fill */
+  --color-accent-text: #f5f5f5;
+  --color-accent-soft: #141414; /* surface-2 wash for tinted surfaces */
+  --color-accent-soft-hover: #1c1c1c; /* surface-3 — hover for soft surfaces */
+  --color-accent-soft-border: #333333; /* border-strong */
+
+  /* Live = arcane violet — LIVENESS AND FOCUS ONLY. Allowed uses: heartbeat,
+     running/active states, active selection bars, link hovers, keyboard-focus
+     accents, the "spark" in the mark. Never a background wash, never decorative,
+     never a gradient. If a screen has more than a few live touches, it's overused. */
+  --color-live: oklch(0.78 0.115 296); /* ~#b5a3f2 — base */
+  --color-live-bright: oklch(0.86 0.09 296); /* hover / emphasized */
+  --color-live-deep: oklch(0.55 0.13 296); /* pressed, dense fills */
+  --color-live-border: oklch(0.78 0.115 296 / 0.45);
+  --color-live-tint: oklch(0.78 0.115 296 / 0.1);
+  --color-on-live: #0a0a0a;
+
+  /* Error — the only other hue. Blocked/failed states ONLY. */
+  --color-error: #ffb4ab;
+  --color-error-deep: #93000a;
+  --color-error-soft: rgb(255 180 171 / 0.08);
+  --color-error-soft-hover: rgb(255 180 171 / 0.14);
+  --color-error-soft-border: rgb(255 180 171 / 0.4);
+
+  /* Success + warning + queued are grayscale — conveyed by text label + icon,
+     never a hue. These grays keep existing -soft / -soft-border consumers legible
+     against the dark surfaces without introducing color. */
+  --color-success: #a3a3a3; /* text-2 — rendered with a check icon */
+  --color-success-soft: #141414;
+  --color-success-soft-hover: #1c1c1c;
+  --color-success-soft-border: #333333;
+
+  --color-warning: #d6d6d6; /* gray-9 — rendered with an alert icon */
+  --color-warning-soft: #141414;
+  --color-warning-soft-hover: #1c1c1c;
+  --color-warning-soft-border: #4d4d4d;
+
+  /* Typography — one UI family. Geist carries ALL interface text: reading text
+     (300–700), labels, chips, IDs, timestamps, and data readouts. JetBrains Mono
+     is reserved for actual code — code/pre, diffs, log lines, and copyable
+     technical strings — where character alignment is functional. Token names
+     held so `font-sans` / `font-display` / `font-mono` resolve unchanged. */
+  --font-display: "Geist Variable", "Geist", "Helvetica Neue", Arial, sans-serif;
+  --font-sans: "Geist Variable", "Geist", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, monospace;
+  --tracking-mono: 0.08em;
+
+  /* Radius — 0px everywhere. Sharp 90° angles are the brand signature. Token
+     names held so `rounded-sm/md/lg/xl` all resolve to a hard edge. */
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --radius-xl: 0px;
+
+  /* Type scale — binds Tailwind `text-*` utilities to the kit scale. Mono labels
+     floor at 12px; reading text floors at 14px; body is 16/1.6; headlines are
+     tight (-0.02em, set on element rules). These OVERRIDE Tailwind v4 defaults so
+     existing `text-*` usages resize into the in-app scale. `--text-md` is net-new
+     (14px secondary body); `--text-2xs`/`--text-xs` keep small-label floors. */
+  --text-2xs: 11px; /* micro mono labels (floor for dense readouts) */
+  --text-2xs--line-height: 1.2;
+  --text-xs: 12px; /* mono labels, badges, timestamps */
+  --text-xs--line-height: 1.3;
+  --text-sm: 13px; /* mono data readouts / caption */
+  --text-sm--line-height: 1.5;
+  --text-base: 14px; /* small reading text (reading floor) */
+  --text-base--line-height: 1.55;
+  --text-md: 14px; /* secondary body */
+  --text-md--line-height: 1.55;
+  --text-lg: 16px; /* body / primary reading */
+  --text-lg--line-height: 1.6;
+  --text-xl: 20px; /* headline M — section titles */
+  --text-xl--line-height: 1.4;
+  --text-2xl: 24px; /* large section heads */
+  --text-2xl--line-height: 1.3;
+  --text-3xl: 32px; /* headline L — page titles */
+  --text-3xl--line-height: 1.2;
+  --text-4xl: 40px; /* hero heading (opt-in) */
+  --text-4xl--line-height: 1.1;
+
+  /* Control disabled + elevation. Elevation is a hairline ring + faint glow, not
+     a soft drop shadow. Kept as tokens so legacy `--shadow-card`/`-elevated`
+     consumers render a crisp bordered lift. */
+  --disabled-opacity: 0.4;
+  --shadow-card: 0 0 0 1px var(--color-border);
+  --shadow-elevated: 0 0 0 1px var(--color-border-strong);
+
+  /* Glows — the only permitted "shadows": faint white bloom on primary hover,
+     faint accent bloom on live elements, faint error bloom on blocked. */
+  --glow-white: 0 0 8px rgb(255 255 255 / 0.25);
+  --glow-live: 0 0 10px oklch(0.78 0.115 296 / 0.35);
+  --glow-error: 0 0 8px rgb(255 180 171 / 0.3);
+
+  /* Motion — crisp and quick; no bounces, no springs, no parallax. 120–200ms
+     ease-out only. Names held so existing `--ease-editorial`/`-marketing`
+     consumers retune rather than break. */
+  --ease-editorial: cubic-bezier(0.2, 0, 0, 1);
+  --ease-marketing: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --duration-fast: 120ms;
+  --duration-med: 200ms;
+}
+
+/* ----- Base layer ----- */
+
+html {
+  height: 100vh;
+  height: 100dvh;
+  background: var(--color-surface-0);
+  color-scheme: dark;
+  scrollbar-color: var(--color-border-strong) transparent;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-feature-settings: "cv01", "ss03";
+  background: var(--color-surface-0);
+  color: var(--color-text-primary);
+  height: 100vh;
+  height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* No grain, no textures. The void is flat black. */
+body::before {
+  content: none;
+}
+
+/* No radial light falloff — Monochrome Control uses flat surfaces and tonal
+   borders for depth, never a glow cloud on the page. Slot kept empty. */
+body::after {
+  content: none;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  position: relative;
+  z-index: 2;
+}
+
+/* ----- Typography — Geist headlines, tight and medium-heavy. Element rules live
+   in @layer base so Tailwind utilities win without `!important`. Scoped away from
+   .markdown-content so AI-generated markdown headings keep normal prose sizing. */
+
+@layer base {
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: var(--font-sans);
+    font-variation-settings: normal;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  h1 {
+    font-size: 32px;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 20px;
+    line-height: 1.4;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  h3 {
+    font-size: 16px;
+    line-height: 1.4;
+    letter-spacing: 0;
+  }
+  h4 {
+    font-size: 15px;
+    line-height: 1.4;
+    letter-spacing: 0;
+  }
+  h5 {
+    font-size: 14px;
+    line-height: 1.5;
+    letter-spacing: 0;
+  }
+  /* h6 is the small metadata label — Geist, sentence case (one-family collapse
+     retired the mono/uppercase instrument register). */
+  h6 {
+    font-family: var(--font-sans);
+    font-size: 12px;
+    line-height: 1.4;
+    letter-spacing: -0.01em;
+    font-weight: 600;
+    color: var(--color-text-secondary);
+  }
+
+  p,
+  li {
+    font-size: 16px;
+    line-height: 1.6;
+    text-wrap: pretty;
+  }
+
+  small,
+  .caption {
+    font-size: 13px;
+    color: var(--color-text-muted);
+  }
+}
+
+/* Opt-in hero scale — marketing-weight display headline. Kept in @layer
+   components so Tailwind `text-*` utilities still win without `!important`. */
+@layer components {
+  .display-1 {
+    font-size: clamp(40px, 6vw, 64px);
+    line-height: 1.05;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    text-wrap: balance;
+  }
+  .display-2 {
+    font-size: clamp(32px, 4vw, 48px);
+    line-height: 1.1;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+
+  /* Control-height ladder — kit is 28/36/44px. Single-line controls center with
+     inline-flex; textareas must NOT (breaks multiline + field-sizing autosize)
+     and use `.control-textarea`. Token names held so component classes resolve. */
+  .control-lg {
+    min-height: 44px;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+    display: inline-flex;
+    align-items: center;
+  }
+  .control-md {
+    min-height: 36px;
+    padding-top: 0.375rem;
+    padding-bottom: 0.375rem;
+    display: inline-flex;
+    align-items: center;
+  }
+  .control-sm {
+    min-height: 28px;
+    padding-top: 0.25rem;
+    padding-bottom: 0.25rem;
+    display: inline-flex;
+    align-items: center;
+  }
+  .control-textarea {
+    min-height: 44px;
+    padding: 0.5rem 0.75rem;
+    line-height: 1.6;
+  }
+}
+
+/* Markdown headings carry their own Tailwind size utilities (see
+   MarkdownContent.tsx). This reset neutralizes the inherited mono/uppercase/
+   tracking so any fall-through heading reads as normal prose. */
+.markdown-content :is(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--font-sans);
+  font-variation-settings: normal;
+  letter-spacing: normal;
+  line-height: 1.3;
+  text-transform: none;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+/* Code, pre, kbd, samp — JetBrains Mono with tabular figures. */
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum", "zero";
+}
+
+/* Utility classes — used by components directly. */
+.font-display {
+  font-family: var(--font-sans);
+  font-variation-settings: normal;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.font-display-tight {
+  font-family: var(--font-sans);
+  font-variation-settings: normal;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+}
+
+/* Tabular readouts — timestamps, counts, IDs. Stays in the reading family
+   (Geist) with tabular figures so digit columns still align without a font
+   switch. Name held stable so existing `.font-mono-tabular` usages resolve
+   unchanged after the one-family collapse. */
+.font-mono-tabular {
+  font-family: var(--font-sans);
+  font-feature-settings: "tnum";
+  font-variant-numeric: tabular-nums;
+}
+
+.numeral {
+  font-family: var(--font-sans);
+  font-variation-settings: normal;
+  font-weight: 500;
+  font-feature-settings: "tnum";
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+.font-display-italic {
+  font-family: var(--font-sans);
+  font-style: italic;
+  font-variation-settings: normal;
+}
+
+/* Small metadata label — section eyebrows and column headers. One-family
+   collapse: Geist, sentence case, no wide tracking (the old mono/uppercase
+   instrument register is retired). 12px, weight 500, muted. */
+.eyebrow {
+  font-family: var(--font-sans);
+  font-feature-settings: "tnum";
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-muted);
+}
+
+/* Live variant of the metadata label — reserved for running/active readouts. */
+.eyebrow-accent {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-live);
+}
+
+/* Selection — flat live-violet fill, per the kit. */
+::selection {
+  background: var(--color-live);
+  color: var(--color-on-live);
+}
+
+/* Scrollbar — thin, achromatic, sharp (no radius). */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-hover);
+}
+
+/* Focus — the kit rule: border flips to white, plus a 1px white outline offset
+   2px. No glow ring. */
+*:focus-visible {
+  outline: 1px solid var(--color-border-focus);
+  outline-offset: 2px;
+  border-color: var(--color-border-focus);
+}
+
+:is(button, a, input, select, textarea, summary) {
+  touch-action: manipulation;
+}
+
+/* Cursor affordance for buttons and button-like roles. */
+:is(button, [role="button"]):not(:disabled) {
+  cursor: pointer;
+}
+:is(button, [role="button"]):disabled {
+  cursor: not-allowed;
+}
+
+/* Native controls default to 0 radius (hard edge) unless a shape utility
+   intentionally overrides them. */
+:is(button, select, textarea, summary, [role="button"], input:not([type="checkbox"]):not([type="radio"])) {
+  border-radius: var(--radius-md);
+}
+
+/* Press feedback — no shrink or transform in Monochrome Control; presses flatten
+   by darkening. `.btn-press` owns the whole interactive transition (ink, fill,
+   border, glow, brightness) on the system curve: the transition lives on the
+   base rule so the brightness release is interruptible, and box-shadow is
+   included so glow hovers bloom/fade instead of snapping. Deliberately
+   unlayered so it wins over per-element `transition-colors` utilities. */
+:where(.btn-press) {
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    box-shadow var(--duration-fast) var(--ease-out),
+    filter var(--duration-fast) var(--ease-out);
+}
+:where(.btn-press):not(:disabled):active {
+  filter: brightness(0.9);
+}
+
+@layer utilities {
+  .z-sticky-local {
+    z-index: 10;
+  }
+
+  .z-dropdown {
+    z-index: 30;
+  }
+
+  .z-tooltip {
+    z-index: 30;
+  }
+
+  .z-modal {
+    z-index: 50;
+  }
+
+  .z-toast {
+    z-index: 60;
+  }
+
+  .control-room-canvas {
+    min-height: 100%;
+    background: transparent;
+  }
+
+  .control-room-page {
+    margin: 0;
+    border-radius: 0;
+  }
+
+  .control-room-content {
+    margin-inline: auto;
+    width: 100%;
+    max-width: 65rem; /* 1040px content max */
+    padding: 56px 40px 64px;
+  }
+
+  @media (max-width: 768px) {
+    .control-room-page {
+      margin: 0;
+      border-width: 0;
+      border-radius: 0;
+    }
+
+    .control-room-content {
+      padding: 32px 16px 48px;
+    }
+  }
+
+  /* Optional dot-grid page backdrop — 32px grid at low opacity for large
+     canvases. Flat, no gradient wash. */
+  .dot-grid {
+    background-image: radial-gradient(circle at 1px 1px, var(--color-border) 1px, transparent 0);
+    background-size: 32px 32px;
+  }
+
+  /* Session detail surface system — transcript cards, inline action cards, and
+     the follow-up composer read as one family: flat surface, 1px tonal border,
+     sharp corners. Kept in Tailwind's utilities layer so state utilities on the
+     same element can still override. */
+  .session-stack-surface {
+    --session-stack-border-width: 1px;
+    --session-stack-border-color: var(--color-border);
+    --session-stack-bg: var(--color-surface-1);
+    border-style: solid;
+    border-width: var(--session-stack-border-width);
+    border-color: var(--session-stack-border-color);
+    border-left-width: var(--session-stack-border-left-width, var(--session-stack-border-width));
+    border-left-color: var(--session-stack-border-left-color, var(--session-stack-border-color));
+    background-color: var(--session-stack-bg);
+    border-radius: 0;
+  }
+
+  .session-stack-surface-accent {
+    --session-stack-border-color: var(--color-accent-soft-border);
+    --session-stack-bg: var(--color-accent-soft);
+  }
+
+  .session-stack-surface-accent-muted {
+    --session-stack-border-color: var(--color-accent-soft-border);
+    --session-stack-bg: var(--color-surface-1);
+  }
+
+  .session-stack-surface-warning-muted {
+    --session-stack-border-color: var(--color-warning-soft-border);
+    --session-stack-bg: var(--color-surface-2);
+  }
+
+  /* Live left-bar — a 2px selection/active indicator in arcane violet. Bars, not
+     pills, mark active state. */
+  .session-stack-surface-left-accent {
+    --session-stack-border-left-width: 2px;
+    --session-stack-border-left-color: var(--color-live);
+  }
+
+  /* Elevated composer variant — full surface-1 plus a bordered ring, so the
+     follow-up composer lifts off the transcript plane without a soft shadow. */
+  .session-stack-surface-raised {
+    --session-stack-bg: var(--color-surface-1);
+    box-shadow: var(--shadow-elevated);
+  }
+
+  .command-composer {
+    --session-stack-bg: var(--color-surface-2);
+    --session-stack-border-color: var(--color-border-strong);
+    border-radius: 0;
+    /* No overflow clipping: the repo/model select panels, prompt autocomplete
+       dropdowns, and the send-button tooltip are absolutely positioned
+       descendants that must escape the composer box. Corners are 0, so there
+       is nothing to clip. */
+  }
+
+  .command-composer textarea:focus-visible {
+    outline: none;
+  }
+
+  .command-composer-toolbar {
+    border-top: 1px solid var(--color-border);
+  }
+
+  .session-stack-dense {
+    min-height: 56px;
+    padding: 14px 16px;
+  }
+
+  /* Sanctioned glow hovers — the only permitted "shadows". A faint white bloom
+     on the primary (white ink) button and a faint violet bloom on live actions.
+     Named here so components apply a token utility instead of arbitrary
+     `shadow-[...]` strings. */
+  .glow-white-hover,
+  .glow-live-hover {
+    transition: box-shadow var(--duration-fast) var(--ease-out);
+  }
+  .glow-white-hover:hover:not(:disabled) {
+    box-shadow: var(--glow-white);
+  }
+  .glow-live-hover:hover:not(:disabled) {
+    box-shadow: var(--glow-live);
+  }
+
+  /* Extended hit area — an invisible ::after pad that grows the pointer target
+     to at least 40x40px without changing visible geometry (min() keeps larger
+     controls unchanged). Used by IconButton; requires the element to establish
+     its own positioning context (the utility sets position: relative). */
+  .hit-area-40 {
+    position: relative;
+  }
+  .hit-area-40::after {
+    content: "";
+    position: absolute;
+    inset: min(0px, calc((100% - 40px) / 2));
+  }
+
+  /* Interactive row hover — steps the surface up one tonal level. No transform,
+     no shadow; the tonal shift carries the "lift". */
+  .row-hover-lift {
+    transition: background-color var(--duration-med) var(--ease-out);
+  }
+  .row-hover-lift:hover {
+    background-color: var(--color-surface-2);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row-hover-lift {
+    transition-duration: 1ms;
+  }
+}
+
+/* Route-mount reveal — a short fade + single-axis rise. No bounce. */
+@keyframes editorial-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.editorial-rise {
+  animation: editorial-rise var(--duration-med) var(--ease-out) both;
+}
+.editorial-rise-1 {
+  animation-delay: 20ms;
+}
+.editorial-rise-2 {
+  animation-delay: 40ms;
+}
+.editorial-rise-3 {
+  animation-delay: 60ms;
+}
+.editorial-rise-4 {
+  animation-delay: 80ms;
+}
+/* editorial-rise-5 shares the 80ms delay so the reveal settles inside one paint
+   budget rather than dragging past 200ms. */
+.editorial-rise-5 {
+  animation-delay: 80ms;
+}
+
+/* Slide-in from left — mobile sidebar entry. Single-axis, crisp. */
+@keyframes editorial-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.editorial-slide-in {
+  animation: editorial-slide-in var(--duration-med) var(--ease-out) both;
+}
+
+/* Fade-in — conditional banners and status changes. */
+@keyframes editorial-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.editorial-fade {
+  animation: editorial-fade var(--duration-med) var(--ease-out) both;
+}
+
+/* Popover reveal — dropdown menus, select panels, and other anchored
+   surfaces. A fast fade plus a 4px single-axis drop so panels land instead
+   of popping. Exit is unanimated (removal is instant by design). */
+@keyframes menu-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.menu-pop {
+  animation: menu-pop var(--duration-fast) var(--ease-out) both;
+}
+
+/* Group-body reveal — RowGroup and other expandable sections. Content fades
+   in with a 4px rise when a group opens; collapse stays instant so closing
+   feels immediate. */
+@keyframes group-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.group-reveal {
+  animation: group-reveal var(--duration-fast) var(--ease-out) both;
+}
+
+/* Sidebar collapse/expand — the one sanctioned width transition. The canvas
+   must reflow with the rail, so transform cannot carry it; it stays on the
+   system curve. Layout sets body[data-sidebar-resizing] during drag-resize so
+   the transition never rubber-bands behind the cursor. */
+.sidebar-collapse {
+  transition: width var(--duration-med) var(--ease-out);
+}
+
+body[data-sidebar-resizing] .sidebar-collapse {
+  transition: none;
+}
+
+/* Status dot color transitions. Shape variants carry non-color status cues
+   (WCAG 1.4.1). */
+.status-dot {
+  transition: background-color var(--duration-med) var(--ease-out);
+}
+
+.status-dot-pulse {
+  animation: status-pulse 2s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* Heartbeat — the sanctioned system liveness pulse. A live element breathes in
+   arcane violet: opacity dips and a faint accent glow blooms at mid-cycle. The
+   glow follows currentColor so live/success/warning dots tint correctly, but the
+   heartbeat is reserved for live (violet) elements. */
+.review-loop-breathe {
+  animation: arc-heartbeat 2s var(--ease-out) infinite;
+}
+
+@keyframes arc-heartbeat {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: none;
+  }
+  50% {
+    opacity: 0.6;
+    box-shadow: 0 0 10px color-mix(in srgb, currentColor 35%, transparent);
+  }
+}
+
+/* Scoped reduced-motion fallback: hold the steady end-state, no swell/glow. */
+@media (prefers-reduced-motion: reduce) {
+  .review-loop-breathe {
+    animation: none;
+    opacity: 1;
+    box-shadow: none;
+  }
+}
+
+/* Review-loop status chip (detail view). `working` shows a "live" sonar dot — a
+   steady core with an expanding, fading ping ring — reading as "actively
+   listening" without a hard blink. Colors follow currentColor so the chip's live
+   tone tints the dot. */
+.review-loop-sonar {
+  position: relative;
+  display: inline-flex;
+  height: 0.5rem;
+  width: 0.5rem;
+  flex-shrink: 0;
+}
+
+.review-loop-sonar__core,
+.review-loop-sonar__ping {
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  background: currentColor;
+}
+
+.review-loop-sonar__ping {
+  opacity: 0.45;
+  animation: review-loop-ping 1.8s var(--ease-out) infinite;
+}
+
+@keyframes review-loop-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.45;
+  }
+  70%,
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}
+
+/* One-time entrance for the done states — a gentle settle, no bounce past 1.0. */
+.review-loop-settle {
+  animation: review-loop-settle 200ms var(--ease-out) 1;
+}
+
+@keyframes review-loop-settle {
+  0% {
+    transform: scale(0.98);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .review-loop-sonar__ping {
+    animation: none;
+    opacity: 0;
+  }
+  .review-loop-settle {
+    animation: none;
+  }
+}
+
+/* Indeterminate progress sweep — the second sanctioned ambient animation. A live
+   bar sweeps across the track. Apply to a child of a clipped 4px track. */
+.progress-sweep {
+  animation: arc-sweep 1.2s var(--ease-out) infinite;
+}
+
+@keyframes arc-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-sweep {
+    animation: none;
+  }
+}
+
+.status-pill {
+  /* 0 radius — the shared chip family is square. The soft fill + toned dot carry
+     the "status" read, not shape. */
+  border-radius: var(--radius-md);
+  transition:
+    color var(--duration-med) var(--ease-out),
+    background-color var(--duration-med) var(--ease-out),
+    border-color var(--duration-med) var(--ease-out);
+}
+
+/* Filter chip — animated underline reveal from left, in live violet (active
+   selection). */
+.filter-chip-underline {
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--color-live);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform var(--duration-med) var(--ease-out);
+}
+
+.filter-chip-underline-active {
+  transform: scaleX(1);
+}
+
+/* Hairline rule — a classic editorial divider. */
+.rule {
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  margin: 0;
+}
+
+/* Tabular numeric default for anything inside a .session-meta rail. */
+.session-meta {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle inset outline on images — 1px border at a low tone, sharp corners. */
+.img-outline {
+  outline: 1px solid var(--color-border-strong);
+  outline-offset: -1px;
+}
+
+/* CSS containment: isolate layout/paint calculations between sidebar and main. */
+.contain-strict {
+  contain: layout style paint;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

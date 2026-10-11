@@ -1,0 +1,697 @@
+name: Deploy E2B Sandbox Core
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy
+        required: true
+        type: string
+      environment:
+        description: "Target deploy environment: production or qa"
+        required: true
+        type: string
+      force_rebuild:
+        description: Bypass production content-hash skip and rebuild all templates
+        required: false
+        type: boolean
+        default: false
+      skip_cache:
+        description: Bypass E2B layer cache for QA rebuilds
+        required: false
+        type: boolean
+        default: false
+      run_template_build:
+        description: Build and smoke E2B templates before registration
+        required: false
+        type: boolean
+        default: true
+      register_base_templates:
+        description: Register built base templates with the control plane
+        required: false
+        type: boolean
+        default: true
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+jobs:
+  deploy-e2b-sandbox:
+    name: Deploy E2B Sandbox
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: ${{ inputs.environment == 'qa' && 'qa-deploy' || 'deploy-e2b-sandbox' }}
+      cancel-in-progress: ${{ inputs.environment == 'production' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Resolve deployed SHA
+        id: deployed_sha
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "DEPLOY_SHA=$sha" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Restore node_modules cache
+        id: node-modules-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          key: ${{ runner.os }}-${{ runner.arch }}-node-22-node-modules-${{ hashFiles('package-lock.json', 'package.json', 'apps/*/package.json') }}
+        if: ${{ inputs.environment == 'production' && (inputs.run_template_build == true || inputs.register_base_templates == true) }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/cycloid-github-actions-prod
+          aws-region: us-east-1
+        if: ${{ inputs.environment == 'production' }}
+      - name: Load E2B deploy secrets from SSM
+        run: |
+          set -euo pipefail
+          # Fetch only the E2B deploy secrets this job needs instead of
+          # decrypting the full /cycloid/ bundle.
+          PARAMS_JSON="$(aws ssm get-parameters \
+            --names /cycloid/E2B_API_KEY /cycloid/CI_AUTOMATION_TOKEN \
+            --with-decryption \
+            --query 'Parameters[]' \
+            --output json)"
+          # Mask every returned value before anything can echo them — a
+          # stray set -x or error dumping $PARAMS_JSON would otherwise
+          # leak the selected E2B deploy secrets.
+          while IFS=$'\t' read -r _ value; do
+            if [ -n "$value" ]; then
+              echo "::add-mask::$value"
+            fi
+          done < <(echo "$PARAMS_JSON" | jq -r '.[] | "\(.Name)\t\(.Value)"')
+          E2B_API_KEY="$(echo "$PARAMS_JSON" | jq -r '.[] | select(.Name=="/cycloid/E2B_API_KEY") | .Value')"
+          CI_AUTOMATION_TOKEN="$(echo "$PARAMS_JSON" | jq -r '.[] | select(.Name=="/cycloid/CI_AUTOMATION_TOKEN") | .Value')"
+          unset PARAMS_JSON
+          if [ "${{ inputs.run_template_build }}" = "true" ] && { [ -z "$E2B_API_KEY" ] || [ "$E2B_API_KEY" = "CHANGE_ME" ]; }; then
+            echo "::error::/cycloid/E2B_API_KEY is missing or still a placeholder"
+            exit 1
+          fi
+          if { [ "${{ inputs.run_template_build }}" = "true" ] || [ "${{ inputs.register_base_templates }}" = "true" ]; } && { [ -z "$CI_AUTOMATION_TOKEN" ] || [ "$CI_AUTOMATION_TOKEN" = "CHANGE_ME" ]; }; then
+            echo "::error::/cycloid/CI_AUTOMATION_TOKEN is missing or still a placeholder"
+            exit 1
+          fi
+          echo "E2B_API_KEY=$E2B_API_KEY" >> "$GITHUB_ENV"
+          echo "CI_AUTOMATION_TOKEN=$CI_AUTOMATION_TOKEN" >> "$GITHUB_ENV"
+        if: ${{ inputs.environment == 'production' && (inputs.run_template_build == true || inputs.register_base_templates == true) }}
+      - name: Install dependencies
+        run: HUSKY=0 npm ci --no-audit --no-fund
+        if: ${{ inputs.environment == 'production' && (inputs.run_template_build == true || inputs.register_base_templates == true) && steps.node-modules-cache.outputs.cache-hit != 'true' }}
+      - name: Build production E2B sandbox template
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild == true }}
+        run: |
+          set -euo pipefail
+          args=(--prod --include-repo-spec-templates --skip-matching-registry --registry-url https://api.trycycloid.com)
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            args+=(--force-rebuild)
+          fi
+          bash scripts/e2b-template-build.sh "${args[@]}"
+        if: ${{ inputs.environment == 'production' && inputs.run_template_build == true }}
+      - name: Smoke test the production template
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          seen_templates=""
+          while IFS= read -r line; do
+            case "$line" in
+              E2B_SANDBOX_TEMPLATE=*)
+                template="${line#E2B_SANDBOX_TEMPLATE=}"
+                ;;
+              E2B_REPO_SANDBOX_TEMPLATE=*)
+                value="${line#E2B_REPO_SANDBOX_TEMPLATE=}"
+                template="${value#*:}"
+                ;;
+              *)
+                continue
+                ;;
+            esac
+            # Repo specs can share a tier (e.g. several repos on mem8192-cpu4);
+            # smoke each unique template ref once.
+            case " $seen_templates " in *" $template "*) continue ;; esac
+            seen_templates="$seen_templates $template"
+            npm run smoke:e2b:compat -- --template "$template"
+          done < <(bash scripts/e2b-template-build.sh --prod --include-repo-spec-templates --print-template)
+        if: ${{ inputs.environment == 'production' && inputs.run_template_build == true }}
+      - name: Ensure prod Cloudflare R2 buckets exist
+        run: |
+          # Older-ref rollback guard: manual deploys check out inputs.ref, which can
+          # predate these scripts. Skip rather than fail so old refs stay deployable.
+          if [ -f scripts/ensure-cloudflare-r2-buckets.sh ]; then
+            bash scripts/ensure-cloudflare-r2-buckets.sh cycloid-bridge-bundles
+          else
+            echo "ensure-cloudflare-r2-buckets.sh absent in this ref; skipping."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'production' && inputs.run_template_build == true }}
+      - name: Publish Freestyle boot artifacts to R2
+        # Fails the deploy loudly on publish failure — shipping without publishing
+        # would silently recreate the stale-bridge or stale-start-script bug.
+        # The template build above already bundled; re-bundle here so publish is
+        # self-contained and independent of that step's skip paths (esbuild output
+        # is deterministic).
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/publish-bridge-bundle.mjs ]; then
+            echo "publish-bridge-bundle.mjs absent in this ref (older-ref rollback); skipping publish."
+            exit 0
+          fi
+          npm run bundle:sandbox-core-apps
+          node scripts/publish-bridge-bundle.mjs --bucket cycloid-bridge-bundles
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'production' && inputs.run_template_build == true }}
+      - name: Register production sandbox base templates
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          fatal_file="${RUNNER_TEMP}/sandbox-base-template-registration-fatal"
+          rm -f "$fatal_file"
+          mark_fatal_registration_error() {
+            local exit_code="$1"
+            {
+              echo "Sandbox base-template registration setup failed before the retryable HTTP registration path."
+              echo "Exit code: ${exit_code}"
+            } > "$fatal_file"
+          }
+          trap 'exit_code=$?; mark_fatal_registration_error "$exit_code"; exit "$exit_code"' ERR
+          BASES="$(jq -n '[]')"
+          CAPABILITIES="$(jq -n '[]')"
+          TEMPLATE_LINES="$(bash scripts/e2b-template-build.sh --prod --include-repo-spec-templates --skip-bundles --print-template --print-content-hashes)"
+          declare -A BASE_TEMPLATE_REFS=()
+          while IFS= read -r line; do
+            case "$line" in
+              E2B_SANDBOX_TEMPLATE_AGENT_BACKENDS=*)
+                backends_csv="${line#E2B_SANDBOX_TEMPLATE_AGENT_BACKENDS=}"
+                CAPABILITIES="$(jq -nc --arg csv "$backends_csv" '$csv | split(",") | map(select(length > 0))')"
+                continue
+                ;;
+              E2B_SANDBOX_TEMPLATE=*)
+                resource_profile_key="default"
+                base_template_ref="${line#E2B_SANDBOX_TEMPLATE=}"
+                BASE_TEMPLATE_REFS["$resource_profile_key"]="$base_template_ref"
+                continue
+                ;;
+              E2B_SANDBOX_TEMPLATE_CONTENT_HASH=*)
+                resource_profile_key="default"
+                base_template_ref="${BASE_TEMPLATE_REFS[$resource_profile_key]:-}"
+                content_hash="${line#E2B_SANDBOX_TEMPLATE_CONTENT_HASH=}"
+                ;;
+              E2B_REPO_SANDBOX_TEMPLATE=*)
+                value="${line#E2B_REPO_SANDBOX_TEMPLATE=}"
+                resource_profile_key="${value%%:*}"
+                base_template_ref="${value#*:}"
+                BASE_TEMPLATE_REFS["$resource_profile_key"]="$base_template_ref"
+                continue
+                ;;
+              E2B_REPO_SANDBOX_TEMPLATE_CONTENT_HASH=*)
+                value="${line#E2B_REPO_SANDBOX_TEMPLATE_CONTENT_HASH=}"
+                resource_profile_key="${value%%:*}"
+                content_hash="${value#*:}"
+                base_template_ref="${BASE_TEMPLATE_REFS[$resource_profile_key]:-}"
+                ;;
+              *)
+                continue
+                ;;
+            esac
+            if [ -z "$base_template_ref" ] || [ -z "$content_hash" ]; then
+              echo "::error::Missing template ref or content hash for ${resource_profile_key}"
+              exit 1
+            fi
+            BASES="$(jq \
+              --arg resourceProfileKey "$resource_profile_key" \
+              --arg baseTemplateRef "$base_template_ref" \
+              --arg baseVersion "$content_hash" \
+              --arg contentHash "$content_hash" \
+              --arg gitSha "$DEPLOY_SHA" \
+              --arg workflowRunUrl "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --arg githubActor "$GITHUB_ACTOR" \
+              '. + [{
+                resourceProfileKey: $resourceProfileKey,
+                baseTemplateRef: $baseTemplateRef,
+                baseVersion: $baseVersion,
+                contentHash: $contentHash,
+                gitSha: $gitSha,
+                workflowRunUrl: $workflowRunUrl,
+                githubActor: $githubActor,
+                smokeStatus: "passed"
+              }]' <<< "$BASES")"
+          done <<< "$TEMPLATE_LINES"
+          if [ "$(jq 'length' <<< "$BASES")" -eq 0 ]; then
+            echo "::error::No production sandbox base templates were collected for registration"
+            exit 1
+          fi
+          PAYLOAD="$(jq -n \
+            --arg provider "e2b" \
+            --arg runtimeBackend "e2b_cloud" \
+            --argjson bases "$BASES" \
+            --argjson capabilities "$CAPABILITIES" \
+            '{provider: $provider, runtimeBackend: $runtimeBackend, bases: $bases, capabilities: $capabilities}')"
+          register_url="https://api.trycycloid.com/api/admin/sandbox-base-templates/register"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          for attempt in 1 2 3 4 5 6; do
+            status="$(
+              curl -sS \
+                -o "$response_file" \
+                -w "%{http_code}" \
+                -X POST "$register_url" \
+                -H "Authorization: Bearer ${CI_AUTOMATION_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD" || true
+            )"
+            if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+              cat "$response_file"
+              exit 0
+            fi
+            if [ "$status" = "000" ] || [ "$status" = "404" ] || { [ "$status" -ge 500 ] && [ "$status" -lt 600 ]; }; then
+              echo "::warning::Sandbox base-template registration returned HTTP ${status} on attempt ${attempt}; control-plane deploy may not have reached production yet."
+              if [ "$attempt" -lt 6 ]; then
+                sleep 20
+                continue
+              fi
+              echo "::warning::Skipping sandbox base-template registration after repeated HTTP ${status} responses. The E2B template deploy and smoke succeeded; layer builds will use the existing environment fallback until the route is deployed and registration is rerun."
+              exit 1
+            fi
+            echo "::error::Sandbox base-template registration failed with HTTP ${status}"
+            cat "$response_file"
+            {
+              echo "Sandbox base-template registration failed with HTTP ${status}."
+              cat "$response_file"
+            } > "$fatal_file"
+            exit 1
+          done
+        if: ${{ inputs.environment == 'production' && inputs.register_base_templates == true }}
+      - name: Fail on fatal sandbox base-template registration errors
+        if: ${{ inputs.environment == 'production' && inputs.register_base_templates == true && !cancelled() }}
+        run: |
+          set -euo pipefail
+          fatal_file="${RUNNER_TEMP}/sandbox-base-template-registration-fatal"
+          if [ -s "$fatal_file" ]; then
+            cat "$fatal_file"
+            exit 1
+          fi
+      - name: Notify Slack
+        if: ${{ inputs.environment == 'production' && !cancelled() && inputs.notify_slack != false }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ steps.deployed_sha.outputs.sha }}
+          REPO: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+          SERVICE_NAME: PROD E2B Sandbox
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          if [ "$JOB_STATUS" = "success" ]; then
+            EMOJI=":white_check_mark:"
+            STATUS="succeeded"
+          else
+            EMOJI=":x:"
+            STATUS="failed"
+          fi
+          SHORT_SHA="${SHA::7}"
+          SUBJECT="$(git log -1 --format=%s "$SHA" 2>/dev/null || true)"
+          if [ -z "$SUBJECT" ] && [ -n "$HEAD_COMMIT_MESSAGE" ]; then
+            SUBJECT="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          fi
+          SUBJECT="$(printf '%s' "$SUBJECT" | cut -c1-72)"
+          SUBJECT="$(printf '%s' "$SUBJECT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+          if [ "$JOB_STATUS" != "success" ]; then
+            MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          else
+            MENTION=""
+          fi
+          PAYLOAD=$(jq -n --arg text "${EMOJI} *deploy ${STATUS}* · ${SERVICE_NAME} · ${SUBJECT} · ${ACTOR} · <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> · <${RUN_URL}|run>${MENTION}" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"
+      - name: Resolve template tag
+        run: |
+          set -euo pipefail
+          # QA uses a STABLE template stem (mirrors prod's arc-default-template),
+          # pinned permanently in wrangler.toml [env.qa.vars].E2B_SANDBOX_TEMPLATE.
+          # The worker appends the -mem<MB>-cpu<N> suffix at spawn; the build below
+          # registers the suffixed tiers. No --var override on the worker deploy →
+          # a bare control-plane deploy can no longer reset it to a placeholder.
+          # TEMPLATE_SHA is for SENTRY_RELEASE + the deploy notification only.
+          TEMPLATE_SHA="$(git rev-parse HEAD)"
+          echo "TEMPLATE_SHA=$TEMPLATE_SHA" >> "$GITHUB_ENV"
+          echo "E2B_SANDBOX_TEMPLATE=cycloid-sandbox-qa" >> "$GITHUB_ENV"
+          echo "E2B_SANDBOX_TEMPLATE=cycloid-sandbox-qa"
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/cycloid-github-actions-qa
+          aws-region: us-east-1
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Load QA E2B deploy secrets from SSM
+        run: |
+          set -euo pipefail
+          # Fetch only the E2B deploy secrets this job needs instead of
+          # decrypting the full /cycloid/qa/ bundle.
+          PARAMS_JSON="$(aws ssm get-parameters \
+            --names /cycloid/qa/E2B_API_KEY /cycloid/qa/CI_AUTOMATION_TOKEN \
+            --with-decryption \
+            --query 'Parameters[]' \
+            --output json)"
+          # Mask every returned value before anything can echo them — a
+          # stray set -x or error dumping $PARAMS_JSON would otherwise
+          # leak the selected QA E2B deploy secrets.
+          while IFS=$'\t' read -r _ value; do
+            if [ -n "$value" ]; then
+              echo "::add-mask::$value"
+            fi
+          done < <(echo "$PARAMS_JSON" | jq -r '.[] | "\(.Name)\t\(.Value)"')
+          E2B_API_KEY="$(echo "$PARAMS_JSON" | jq -r '.[] | select(.Name=="/cycloid/qa/E2B_API_KEY") | .Value')"
+          CI_AUTOMATION_TOKEN="$(echo "$PARAMS_JSON" | jq -r '.[] | select(.Name=="/cycloid/qa/CI_AUTOMATION_TOKEN") | .Value')"
+          unset PARAMS_JSON
+          if [ -z "$E2B_API_KEY" ] || [ "$E2B_API_KEY" = "CHANGE_ME" ]; then
+            echo "::error::/cycloid/qa/E2B_API_KEY is missing or still a placeholder"
+            exit 1
+          fi
+          if [ -z "$CI_AUTOMATION_TOKEN" ] || [ "$CI_AUTOMATION_TOKEN" = "CHANGE_ME" ]; then
+            echo "::error::/cycloid/qa/CI_AUTOMATION_TOKEN is missing or still a placeholder"
+            exit 1
+          fi
+          echo "E2B_API_KEY=$E2B_API_KEY" >> "$GITHUB_ENV"
+          echo "CI_AUTOMATION_TOKEN=$CI_AUTOMATION_TOKEN" >> "$GITHUB_ENV"
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Install dependencies
+        run: HUSKY=0 npm ci --no-audit --no-fund
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Bundle sandbox apps
+        run: npm run bundle:sandbox-core-apps
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Build QA E2B sandbox template
+        env:
+          E2B_SKIP_CACHE: ${{ inputs.skip_cache && '1' || '' }}
+          SKIP_CACHE: ${{ inputs.skip_cache == true }}
+        run: |
+          set -euo pipefail
+          args=(--skip-bundles --qa --include-repo-spec-templates --skip-matching-registry --registry-url https://qa.trycycloid.com)
+          if [ "$SKIP_CACHE" = "true" ]; then
+            args+=(--force-rebuild)
+          fi
+          bash scripts/e2b-template-build.sh "${args[@]}"
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Smoke test sandbox egress allowlist
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          seen_templates=""
+          while IFS= read -r line; do
+            case "$line" in
+              E2B_SANDBOX_TEMPLATE=*)
+                template="${line#E2B_SANDBOX_TEMPLATE=}"
+                ;;
+              E2B_REPO_SANDBOX_TEMPLATE=*)
+                value="${line#E2B_REPO_SANDBOX_TEMPLATE=}"
+                template="${value#*:}"
+                ;;
+              *)
+                continue
+                ;;
+            esac
+            # Repo specs can share a tier (e.g. several repos on mem8192-cpu4);
+            # smoke each unique template ref once.
+            case " $seen_templates " in *" $template "*) continue ;; esac
+            seen_templates="$seen_templates $template"
+            npm run smoke:e2b:egress -- --template "$template"
+          done < <(bash scripts/e2b-template-build.sh --qa --include-repo-spec-templates --print-template)
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Ensure QA Cloudflare Queues exist
+        run: |
+          bash scripts/ensure-cloudflare-queues.sh \
+            cycloid-traces-qa \
+            cycloid-traces-dlq-qa \
+            cycloid-memory-analysis-qa \
+            cycloid-memory-refine-qa \
+            cycloid-memory-refine-dlq-qa \
+            cycloid-sandbox-layer-builds-qa
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Ensure QA Cloudflare R2 buckets exist
+        run: |
+          # Older-ref rollback guard, mirroring the prod ensure step.
+          if [ -f scripts/ensure-cloudflare-r2-buckets.sh ]; then
+            bash scripts/ensure-cloudflare-r2-buckets.sh cycloid-bridge-bundles-qa
+          else
+            echo "ensure-cloudflare-r2-buckets.sh absent in this ref; skipping."
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Publish Freestyle boot artifacts to QA R2
+        # Mirrors the prod publish for both boot artifacts; the "Bundle sandbox
+        # apps" step already produced dist/bundle.js. Fails loudly on publish
+        # failure.
+        run: |
+          if [ ! -f scripts/publish-bridge-bundle.mjs ]; then
+            echo "publish-bridge-bundle.mjs absent in this ref (older-ref rollback); skipping publish."
+            exit 0
+          fi
+          node scripts/publish-bridge-bundle.mjs --bucket cycloid-bridge-bundles-qa
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Sync E2B_API_KEY to QA worker secret
+        run: printf '%s' "$E2B_API_KEY" | npx wrangler secret put E2B_API_KEY --name cycloid-control-plane-qa
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Run D1 migrations (QA)
+        run: npx wrangler d1 migrations apply cycloid-control-plane-qa --remote --env qa
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Deploy QA worker
+        run: |
+          npx wrangler deploy \
+            --env qa \
+            --var SENTRY_RELEASE:"$TEMPLATE_SHA"
+        working-directory: apps/control-plane-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Register QA sandbox base templates
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          fatal_file="${RUNNER_TEMP}/sandbox-base-template-registration-fatal"
+          rm -f "$fatal_file"
+          mark_fatal_registration_error() {
+            local exit_code="$1"
+            {
+              echo "QA sandbox base-template registration setup failed before the retryable HTTP registration path."
+              echo "Exit code: ${exit_code}"
+            } > "$fatal_file"
+          }
+          trap 'exit_code=$?; mark_fatal_registration_error "$exit_code"; exit "$exit_code"' ERR
+          BASES="$(jq -n '[]')"
+          CAPABILITIES="$(jq -n '[]')"
+          TEMPLATE_LINES="$(bash scripts/e2b-template-build.sh --qa --include-repo-spec-templates --skip-bundles --print-template --print-content-hashes)"
+          declare -A BASE_TEMPLATE_REFS=()
+          expected_base_template_count=0
+          while IFS= read -r line; do
+            case "$line" in
+              E2B_SANDBOX_TEMPLATE_AGENT_BACKENDS=*)
+                backends_csv="${line#E2B_SANDBOX_TEMPLATE_AGENT_BACKENDS=}"
+                CAPABILITIES="$(jq -nc --arg csv "$backends_csv" '$csv | split(",") | map(select(length > 0))')"
+                continue
+                ;;
+              E2B_SANDBOX_TEMPLATE=*)
+                resource_profile_key="default"
+                base_template_ref="${line#E2B_SANDBOX_TEMPLATE=}"
+                BASE_TEMPLATE_REFS["$resource_profile_key"]="$base_template_ref"
+                expected_base_template_count=$((expected_base_template_count + 1))
+                continue
+                ;;
+              E2B_SANDBOX_TEMPLATE_CONTENT_HASH=*)
+                resource_profile_key="default"
+                # Content-hash lines must follow their matching template-ref line so the payload can pair them.
+                base_template_ref="${BASE_TEMPLATE_REFS[$resource_profile_key]:-}"
+                content_hash="${line#E2B_SANDBOX_TEMPLATE_CONTENT_HASH=}"
+                ;;
+              E2B_REPO_SANDBOX_TEMPLATE=*)
+                value="${line#E2B_REPO_SANDBOX_TEMPLATE=}"
+                resource_profile_key="${value%%:*}"
+                base_template_ref="${value#*:}"
+                BASE_TEMPLATE_REFS["$resource_profile_key"]="$base_template_ref"
+                expected_base_template_count=$((expected_base_template_count + 1))
+                continue
+                ;;
+              E2B_REPO_SANDBOX_TEMPLATE_CONTENT_HASH=*)
+                value="${line#E2B_REPO_SANDBOX_TEMPLATE_CONTENT_HASH=}"
+                resource_profile_key="${value%%:*}"
+                content_hash="${value#*:}"
+                base_template_ref="${BASE_TEMPLATE_REFS[$resource_profile_key]:-}"
+                ;;
+              *)
+                continue
+                ;;
+            esac
+            if [ -z "$base_template_ref" ] || [ -z "$content_hash" ]; then
+              echo "::error::Missing template ref or content hash for ${resource_profile_key}"
+              exit 1
+            fi
+            BASES="$(jq \
+              --arg resourceProfileKey "$resource_profile_key" \
+              --arg baseTemplateRef "$base_template_ref" \
+              --arg baseVersion "$TEMPLATE_SHA" \
+              --arg contentHash "$content_hash" \
+              --arg gitSha "$TEMPLATE_SHA" \
+              --arg workflowRunUrl "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              --arg githubActor "$GITHUB_ACTOR" \
+              '. + [{
+                resourceProfileKey: $resourceProfileKey,
+                baseTemplateRef: $baseTemplateRef,
+                baseVersion: $baseVersion,
+                contentHash: $contentHash,
+                gitSha: $gitSha,
+                workflowRunUrl: $workflowRunUrl,
+                githubActor: $githubActor,
+                smokeStatus: "passed"
+              }]' <<< "$BASES")"
+          done <<< "$TEMPLATE_LINES"
+          if [ "$(jq 'length' <<< "$BASES")" -eq 0 ]; then
+            echo "::error::No QA sandbox base templates were collected from --print-template output"
+            exit 1
+          fi
+          if [ "$(jq 'length' <<< "$BASES")" -ne "$expected_base_template_count" ]; then
+            echo "::error::Collected $(jq 'length' <<< "$BASES") QA sandbox base templates, expected ${expected_base_template_count}; every template ref must have a paired content hash"
+            exit 1
+          fi
+          PAYLOAD="$(jq -n \
+            --arg provider "e2b" \
+            --arg runtimeBackend "e2b_cloud" \
+            --argjson bases "$BASES" \
+            --argjson capabilities "$CAPABILITIES" \
+            '{provider: $provider, runtimeBackend: $runtimeBackend, bases: $bases, capabilities: $capabilities}')"
+          register_url="https://qa.trycycloid.com/api/admin/sandbox-base-templates/register"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          trap - ERR
+          for attempt in 1 2 3 4 5 6; do
+            status="$(
+              curl -sS \
+                -o "$response_file" \
+                -w "%{http_code}" \
+                -X POST "$register_url" \
+                -H "Authorization: Bearer ${CI_AUTOMATION_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD" || true
+            )"
+            if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+              cat "$response_file"
+              exit 0
+            fi
+            if [ "$status" = "000" ] || [ "$status" = "404" ] || { [ "$status" -ge 500 ] && [ "$status" -lt 600 ]; }; then
+              echo "::warning::QA sandbox base-template registration returned HTTP ${status} on attempt ${attempt}; control-plane deploy may not have reached QA yet."
+              if [ "$attempt" -lt 6 ]; then
+                sleep 20
+                continue
+              fi
+              echo "::warning::Skipping QA sandbox base-template registration after repeated HTTP ${status} responses. The E2B template deploy, smoke, migrations, and worker deploy succeeded; QA opencode sessions will remain fail-closed until the route is live and registration is rerun."
+              exit 1
+            fi
+            echo "::error::QA sandbox base-template registration failed with HTTP ${status}"
+            cat "$response_file"
+            {
+              echo "QA sandbox base-template registration failed with HTTP ${status}."
+              cat "$response_file"
+            } > "$fatal_file"
+            exit 1
+          done
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Fail on fatal QA sandbox base-template registration errors
+        if: ${{ inputs.environment == 'qa' && !cancelled() }}
+        run: |
+          set -euo pipefail
+          fatal_file="${RUNNER_TEMP}/sandbox-base-template-registration-fatal"
+          if [ -s "$fatal_file" ]; then
+            cat "$fatal_file"
+            exit 1
+          fi
+      - name: Print QA template
+        env:
+          DEPLOY_REF: ${{ inputs.ref }}
+        run: |
+          echo "Built QA E2B template from $DEPLOY_REF ($TEMPLATE_SHA)"
+          echo "E2B_SANDBOX_TEMPLATE=$E2B_SANDBOX_TEMPLATE"
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Notify Slack
+        if: ${{ inputs.environment == 'qa' && !cancelled() && inputs.notify_slack != false }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ env.TEMPLATE_SHA }}
+          REPO: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+          SERVICE_NAME: QA E2B Sandbox
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          if [ "$JOB_STATUS" = "success" ]; then
+            EMOJI=":white_check_mark:"
+            STATUS="succeeded"
+          else
+            EMOJI=":x:"
+            STATUS="failed"
+          fi
+          SHORT_SHA="${SHA::7}"
+          SUBJECT="$(git log -1 --format=%s "$SHA" 2>/dev/null || true)"
+          if [ -z "$SUBJECT" ] && [ -n "$HEAD_COMMIT_MESSAGE" ]; then
+            SUBJECT="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          fi
+          SUBJECT="$(printf '%s' "$SUBJECT" | cut -c1-72)"
+          SUBJECT="$(printf '%s' "$SUBJECT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+          if [ "$JOB_STATUS" != "success" ]; then
+            MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          else
+            MENTION=""
+          fi
+          PAYLOAD=$(jq -n --arg text "${EMOJI} *deploy ${STATUS}* · ${SERVICE_NAME} · ${SUBJECT} · ${ACTOR} · <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> · <${RUN_URL}|run>${MENTION}" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"

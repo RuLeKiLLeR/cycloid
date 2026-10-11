@@ -1,0 +1,15 @@
+{
+  "phase": "prompt.dispatch",
+  "timestampMs": 1760000000100,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "startupAttemptId": "startup-1",
+    "bridgeEventType": "prompt_processing",
+    "bridgeData": {
+      "promptId": "prompt-envelope",
+      "message": "Implement the requested change."
+    }
+  }
+}

@@ -1,0 +1,82 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform-plan.yml"
+      - "tests/test_agent/terraform-plan-workflow.test.ts"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform-plan.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v6
+        with:
+          path: infra/.terraform/providers
+          key: terraform-providers-${{ hashFiles('infra/*.tf') }}
+          restore-keys: terraform-providers-
+
+      - name: Typecheck workflow contract
+        run: npx vitest run tests/test_agent/terraform-plan-workflow.test.ts
+
+      - name: Terraform Init
+        run: terraform init -backend=false -input=false -no-color
+        working-directory: infra/
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+        working-directory: infra/
+
+  plan:
+    name: Terraform Plan
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v6
+        with:
+          path: infra/.terraform/providers
+          key: terraform-providers-${{ hashFiles('infra/*.tf') }}
+          restore-keys: terraform-providers-
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -input=false -no-color
+        working-directory: infra/
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -input=false -no-color
+        working-directory: infra/

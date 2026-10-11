@@ -1,0 +1,1 @@
+ALTER TABLE linear_webhook_bootstrap_jobs ADD COLUMN uploaded_images_json TEXT;

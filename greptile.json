@@ -1,0 +1,11 @@
+{
+  "statusCheck": true,
+  "confidenceScoreSection": {
+    "included": true,
+    "collapsible": false,
+    "defaultOpen": false
+  },
+  "triggerOnUpdates": true,
+  "labels": ["greptile"],
+  "excludeAuthors": ["*[bot]"]
+}

@@ -1,0 +1,696 @@
+name: Deploy UI Core
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy
+        required: true
+        type: string
+      environment:
+        description: "Target deploy environment: production or qa"
+        required: true
+        type: string
+      pages_project_name:
+        description: >-
+          Cloudflare Pages project to deploy to. Defaults to the per-environment
+          project (cycloid-ui for production, cycloid-ui-qa for qa) so existing
+          callers are unaffected. Override to target an alternate project (e.g.
+          cycloid-ui-internal) that reuses the production build + R2 upload path.
+        required: false
+        type: string
+        default: ""
+      pages_branch:
+        description: >-
+          Cloudflare Pages deploy branch label (wrangler --branch). Must equal
+          the target project's production_branch so the deploy aliases to the
+          project's custom domain. Defaults to the per-environment value (main
+          for production, qa for qa).
+        required: false
+        type: string
+        default: ""
+      env_tag:
+        description: >-
+          Sentry/Datadog environment tag stamped at build time (VITE_SENTRY_ENV /
+          VITE_DD_ENV). Defaults to the deploy environment. Sentry only reports
+          when this is "production", so non-prod tags (qa, internal) stay silent.
+        required: false
+        type: string
+        default: ""
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      SENTRY_AUTH_TOKEN:
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+jobs:
+  deploy-ui:
+    name: Deploy UI
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate deploy environment
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+        run: |
+          case "$DEPLOY_ENV" in
+            production|qa)
+              ;;
+            *)
+              echo "Unsupported UI deploy environment: $DEPLOY_ENV" >&2
+              exit 1
+              ;;
+          esac
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Resolve deployed SHA
+        id: deployed_sha
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "DEPLOY_SHA=$sha" >> "$GITHUB_ENV"
+      - name: Resolve deploy target
+        id: target
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          IN_PROJECT: ${{ inputs.pages_project_name }}
+          IN_BRANCH: ${{ inputs.pages_branch }}
+          IN_ENV_TAG: ${{ inputs.env_tag }}
+        run: |-
+          set -euo pipefail
+          # Per-environment defaults reproduce the pre-parameterization literals
+          # exactly, so callers that omit the new inputs get byte-identical
+          # behavior (project, deploy branch, env tag, verification origin).
+          if [ "$DEPLOY_ENV" = "production" ]; then
+            default_project="cycloid-ui"
+            default_branch="main"
+            default_origin="https://app.trycycloid.com"
+            default_env_tag="production"
+          else
+            default_project="cycloid-ui-qa"
+            default_branch="qa"
+            default_origin="https://qa.app.trycycloid.com"
+            default_env_tag="qa"
+          fi
+          project="${IN_PROJECT:-$default_project}"
+          branch="${IN_BRANCH:-$default_branch}"
+          env_tag="${IN_ENV_TAG:-$default_env_tag}"
+          # The verification origin follows the env tag when overridden (internal
+          # tag -> internal.app host); otherwise it stays the per-env default.
+          if [ -n "$IN_ENV_TAG" ] && [ "$IN_ENV_TAG" != "$default_env_tag" ]; then
+            origin="https://${IN_ENV_TAG}.app.trycycloid.com"
+          else
+            origin="$default_origin"
+          fi
+          {
+            echo "project=$project"
+            echo "branch=$branch"
+            echo "env_tag=$env_tag"
+            echo "origin=$origin"
+          } >> "$GITHUB_OUTPUT"
+          echo "Deploy target: project=$project branch=$branch env_tag=$env_tag origin=$origin"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Restore node_modules cache
+        id: node-modules-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+          key: ${{ runner.os }}-${{ runner.arch }}-node-22-node-modules-${{ hashFiles('package-lock.json') }}
+      - name: Install dependencies
+        if: steps.node-modules-cache.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Build UI (production)
+        if: ${{ inputs.environment == 'production' }}
+        run: |
+          npm run build:ui
+          npm run inspect:ui-public-artifact
+        env:
+          VITE_SENTRY_RELEASE: ${{ steps.deployed_sha.outputs.sha }}
+          # env_tag defaults to "production" here, so prod builds are unchanged.
+          # An override (e.g. "internal") stamps a non-prod Sentry env, which
+          # keeps Sentry silent (it only reports when env == "production"). This
+          # step intentionally leaves VITE_DD_ENV unset to match prod, so RUM env
+          # falls back to development for prod and internal alike.
+          VITE_SENTRY_ENV: ${{ steps.target.outputs.env_tag }}
+      - name: Build UI (QA)
+        if: ${{ inputs.environment == 'qa' }}
+        run: |
+          npm run build:ui
+          npm run inspect:ui-public-artifact
+        env:
+          VITE_SENTRY_RELEASE: ${{ steps.deployed_sha.outputs.sha }}
+          # env_tag defaults to "qa" for the qa environment; QA has no override.
+          VITE_SENTRY_ENV: ${{ steps.target.outputs.env_tag }}
+          VITE_DD_ENV: ${{ steps.target.outputs.env_tag }}
+      - name: Upload source maps and deploy to Cloudflare Pages
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: cycloid
+          SENTRY_PROJECT: cycloid-ui
+          SENTRY_RELEASE: ${{ steps.deployed_sha.outputs.sha }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DEPLOY_PROJECT: ${{ steps.target.outputs.project }}
+          DEPLOY_BRANCH: ${{ steps.target.outputs.branch }}
+          DEPLOY_ORIGIN: ${{ steps.target.outputs.origin }}
+        run: |
+          set -euo pipefail
+
+          now_seconds() {
+            date +%s
+          }
+
+          run_timed_phase() {
+            local label="$1"
+            shift
+
+            local started_at
+            started_at="$(now_seconds)"
+            echo "::group::${label}"
+            local status=0
+            "$@" || status="$?"
+            if [ "$status" -eq 0 ]; then
+              local finished_at
+              finished_at="$(now_seconds)"
+              echo "${label} completed in $((finished_at - started_at))s"
+              echo "::endgroup::"
+              return 0
+            fi
+
+            local failed_at
+            failed_at="$(now_seconds)"
+            echo "${label} failed after $((failed_at - started_at))s with status ${status}" >&2
+            echo "::endgroup::"
+            return "$status"
+          }
+
+          # 1. Inject Sentry debug IDs (modifies dist files, must run before upload/deploy)
+          inject_sentry_debug_ids() {
+            npm exec --yes --package=@sentry/cli@3.3.5 -- \
+              sentry-cli sourcemaps inject ./dist/ui/assets
+          }
+          run_timed_phase "Inject Sentry debug IDs" inject_sentry_debug_ids
+
+          source_map_manifest="$(mktemp)"
+          trap 'rm -f "$source_map_manifest"' EXIT
+          find dist/ui/assets -type f -name '*.map' | sort | while read -r file; do
+            printf '%s\n' "${file#dist/ui/}"
+          done > "$source_map_manifest"
+          if [ ! -s "$source_map_manifest" ]; then
+            echo "No UI source maps found after build; Sentry upload would be incomplete" >&2
+            exit 1
+          fi
+
+          js_asset="$(find dist/ui/assets -type f -name '*.js' -print -quit)"
+          if [ -z "$js_asset" ]; then
+            echo "No built JavaScript asset found for post-deploy verification" >&2
+            exit 1
+          fi
+          js_asset="${js_asset#dist/ui/}"
+
+          # 2. Upload hashed assets to R2 (must complete before Pages deploy --
+          #    cancel-in-progress could kill a parallel R2 upload after deploy succeeds)
+          upload_to_r2() {
+            local mime_types="js:application/javascript css:text/css woff2:font/woff2 woff:font/woff ttf:font/ttf svg:image/svg+xml png:image/png jpg:image/jpeg jpeg:image/jpeg gif:image/gif webp:image/webp ico:image/x-icon json:application/json wasm:application/wasm"
+            local max_parallel=12
+            local r2_tmp_dir
+            r2_tmp_dir="$(mktemp -d)"
+            local bucket_missing_marker="${r2_tmp_dir}/bucket-missing"
+            local status=0
+            local pids=()
+            local labels=()
+            local batch_started_at=0
+            local batch_index=0
+            local processed_files=0
+            local upload_started_at
+            upload_started_at="$(now_seconds)"
+
+            # Pre-warm the npx cache so parallel `npx wrangler` invocations below
+            # don't race on installing the package (observed failure:
+            # intermittent `sh: 1: wrangler: not found` when 12 workers hit the
+            # cache at once).
+            npx --yes wrangler --version >/dev/null
+
+            upload_one_to_r2() {
+              local file="$1"
+              if [ -f "$bucket_missing_marker" ]; then
+                return 0
+              fi
+
+              local rel="${file#dist/ui/}"
+              local ext="${file##*.}"
+              local content_type="application/octet-stream"
+              for pair in $mime_types; do
+                if [ "${pair%%:*}" = "$ext" ]; then
+                  content_type="${pair#*:}"
+                  break
+                fi
+              done
+
+              local output
+              local attempt=1
+              local max_attempts=3
+              while [ "$attempt" -le "$max_attempts" ]; do
+                if output=$(npx wrangler r2 object put "cycloid-ui-assets/${rel}" \
+                  --file "$file" --content-type "$content_type" --remote 2>&1); then
+                  [ -n "$output" ] && echo "$output"
+                  return 0
+                fi
+
+                if echo "$output" | grep -qi "bucket not found"; then
+                  if ( set -o noclobber; : > "$bucket_missing_marker" ) 2>/dev/null; then
+                    echo "R2 bucket not found, skipping upload"
+                  fi
+                  return 0
+                fi
+
+                if [ "$attempt" -eq "$max_attempts" ]; then
+                  echo "$output" >&2
+                  return 1
+                fi
+
+                local base_delay=$((2 ** (attempt - 1)))
+                local jitter=$((RANDOM % 3))
+                local retry_delay=$((base_delay + jitter))
+                echo "R2 upload attempt ${attempt}/${max_attempts} failed for ${rel}; retrying in ${retry_delay}s" >&2
+                sleep "$retry_delay"
+                attempt=$((attempt + 1))
+              done
+            }
+
+            wait_for_r2_batch() {
+              if [ "${#pids[@]}" -eq 0 ]; then
+                return 0
+              fi
+
+              batch_index=$((batch_index + 1))
+              local batch_size="${#pids[@]}"
+              local i
+              for i in "${!pids[@]}"; do
+                if ! wait "${pids[$i]}"; then
+                  echo "R2 upload failed for ${labels[$i]}" >&2
+                  status=1
+                fi
+              done
+              local batch_finished_at
+              batch_finished_at="$(now_seconds)"
+              processed_files=$((processed_files + batch_size))
+              echo "R2 upload batch ${batch_index} processed ${batch_size} file(s) in $((batch_finished_at - batch_started_at))s"
+              pids=()
+              labels=()
+              batch_started_at=0
+            }
+
+            while IFS= read -r file; do
+              if [ -f "$bucket_missing_marker" ]; then
+                break
+              fi
+
+              local rel="${file#dist/ui/}"
+              if [ "${#pids[@]}" -eq 0 ]; then
+                batch_started_at="$(now_seconds)"
+              fi
+              upload_one_to_r2 "$file" &
+              pids+=($!)
+              labels+=("$rel")
+
+              if [ "${#pids[@]}" -ge "$max_parallel" ]; then
+                wait_for_r2_batch
+              fi
+            done < <(find dist/ui/assets -type f ! -name '*.map' | sort)
+
+            wait_for_r2_batch
+            rm -rf "$r2_tmp_dir"
+            local upload_finished_at
+            upload_finished_at="$(now_seconds)"
+            echo "R2 upload processed ${processed_files} file(s) across ${batch_index} batch(es) with max_parallel=${max_parallel} in $((upload_finished_at - upload_started_at))s"
+            return "$status"
+          }
+
+          # 3. Upload source maps to Sentry before deleting them from the Pages artifact.
+          upload_sourcemaps() {
+            npm exec --yes --package=@sentry/cli@3.3.5 -- \
+              sentry-cli sourcemaps upload \
+              --release "$SENTRY_RELEASE" \
+              --wait \
+              ./dist/ui/assets
+          }
+
+          remove_public_sourcemaps() {
+            while IFS= read -r rel; do
+              rm -f "dist/ui/${rel}"
+            done < "$source_map_manifest"
+
+            if find dist/ui/assets -type f -name '*.map' -print -quit | grep -q .; then
+              echo "Source maps remain in dist/ui/assets after removal" >&2
+              find dist/ui/assets -type f -name '*.map' >&2
+              return 1
+            fi
+          }
+
+          deploy_ui() {
+            # DEPLOY_PROJECT/DEPLOY_BRANCH default to cycloid-ui/main for prod;
+            # an alternate caller (e.g. internal) overrides both. --branch must
+            # equal the target project's production_branch so the deploy aliases
+            # to that project's custom domain.
+            npx wrangler pages deploy dist/ui/ --project-name="$DEPLOY_PROJECT" --branch="$DEPLOY_BRANCH"
+          }
+
+          verify_source_maps_private() {
+            local origin="$DEPLOY_ORIGIN"
+            local tmp_dir
+            local failed=0
+            # A fresh Pages deploy can serve a bare 403 (no cache-control: no-store)
+            # from the Cloudflare WAF/auth edge for up to ~90s while the new
+            # deployment and its header rules propagate. Poll until the deadline
+            # instead of racing a fixed attempt count; the assertion (403/404 +
+            # no-store) is unchanged, only observed once propagation settles.
+            local max_seconds=180
+            local deadline=$((SECONDS + max_seconds))
+            tmp_dir="$(mktemp -d)"
+
+            while IFS= read -r rel; do
+              local headers="${tmp_dir}/headers"
+              local status="000"
+              local cache_control=""
+              local verified=0
+
+              while [ "$SECONDS" -lt "$deadline" ]; do
+                : > "$headers"
+                echo "Verifying private source map ${origin}/${rel}"
+                status="$(curl -sS --connect-timeout 5 --max-time 10 --retry 1 --retry-all-errors --retry-delay 2 \
+                  -D "$headers" -o /dev/null -w "%{http_code}" "${origin}/${rel}")" || status="000"
+                cache_control="$(grep -i '^cache-control:' "$headers" | tail -n 1 | tr -d '\r' || true)"
+                echo "Source map verification status=${status} cache_control=${cache_control:-missing}"
+
+                if { [ "$status" = "403" ] || [ "$status" = "404" ]; } \
+                  && grep -iq '^cache-control:.*no-store' "$headers"; then
+                  verified=1
+                  break
+                fi
+
+                sleep 5
+              done
+
+              if [ "$verified" -ne 1 ]; then
+                if [ "$status" != "403" ] && [ "$status" != "404" ]; then
+                  echo "Expected ${origin}/${rel} to return 403 or 404, got ${status}" >&2
+                fi
+                if ! grep -iq '^cache-control:.*no-store' "$headers"; then
+                  echo "Expected ${origin}/${rel} to include cache-control: no-store" >&2
+                fi
+                echo "Timed out after ${max_seconds}s verifying UI source maps are private" >&2
+                failed=1
+                break
+              fi
+            done < "$source_map_manifest"
+
+            rm -rf "$tmp_dir"
+            return "$failed"
+          }
+
+          verify_js_asset_public() {
+            local origin="$DEPLOY_ORIGIN"
+            local headers
+            local status="000"
+            local cache_control=""
+            # Match the source-map gate's window: the same deploy propagation that
+            # delays the private-map response also delays the public JS asset.
+            local max_seconds=120
+            local deadline=$((SECONDS + max_seconds))
+            headers="$(mktemp)"
+
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              : > "$headers"
+              echo "Verifying public JS asset ${origin}/${js_asset}"
+              status="$(curl -sS --connect-timeout 5 --max-time 10 --retry 1 --retry-all-errors --retry-delay 2 \
+                -D "$headers" -o /dev/null -w "%{http_code}" "${origin}/${js_asset}")" || status="000"
+              cache_control="$(grep -i '^cache-control:' "$headers" | tail -n 1 | tr -d '\r' || true)"
+              echo "JS asset verification status=${status} cache_control=${cache_control:-missing}"
+
+              if [ "$status" = "200" ] && grep -iq '^cache-control:.*public' "$headers"; then
+                rm -f "$headers"
+                return 0
+              fi
+
+              sleep 5
+            done
+
+            if [ "$status" != "200" ]; then
+              echo "Expected ${origin}/${js_asset} to return 200, got ${status}" >&2
+            fi
+            if ! grep -iq '^cache-control:.*public' "$headers"; then
+              echo "Expected ${origin}/${js_asset} to remain publicly cacheable" >&2
+            fi
+            echo "Timed out after ${max_seconds}s verifying built JS asset is public" >&2
+            rm -f "$headers"
+            return 1
+          }
+
+          run_timed_phase "Upload UI assets to R2" upload_to_r2
+          run_timed_phase "Upload UI source maps to Sentry" upload_sourcemaps
+          run_timed_phase "Remove source maps from Pages artifact" remove_public_sourcemaps
+          run_timed_phase "Deploy UI to Cloudflare Pages" deploy_ui
+          run_timed_phase "Verify UI source maps are private" verify_source_maps_private
+          run_timed_phase "Verify built JS asset is public" verify_js_asset_public
+        if: ${{ inputs.environment == 'production' }}
+      - name: Upload source maps to Sentry, deploy, and verify (QA)
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: cycloid
+          SENTRY_PROJECT: cycloid-ui
+          SENTRY_RELEASE: ${{ steps.deployed_sha.outputs.sha }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          # Inject Sentry debug IDs (must run before upload + deploy — mutates dist files).
+          npm exec --yes --package=@sentry/cli@3.3.5 -- \
+            sentry-cli sourcemaps inject ./dist/ui/assets
+
+          # Upload source maps to Sentry (same project as prod; SENTRY_RELEASE
+          # is the git SHA, which is unique per commit — so QA and prod
+          # deploys of the same SHA associate with the same release, while
+          # feature-branch SHAs live under their own release).
+          npm exec --yes --package=@sentry/cli@3.3.5 -- \
+            sentry-cli sourcemaps upload \
+            --release "$SENTRY_RELEASE" \
+            --wait \
+            ./dist/ui/assets
+
+          # Capture manifests BEFORE stripping source maps so we know what
+          # paths to verify after deploy.
+          source_map_manifest="$(mktemp)"
+          trap 'rm -f "$source_map_manifest"' EXIT
+          find dist/ui/assets -type f -name '*.map' | sort | while read -r file; do
+            printf '%s\n' "${file#dist/ui/}"
+          done > "$source_map_manifest"
+          if [ ! -s "$source_map_manifest" ]; then
+            echo "No UI source maps found after build; Sentry upload would be incomplete" >&2
+            exit 1
+          fi
+
+          js_asset="$(find dist/ui/assets -type f -name '*.js' -print -quit)"
+          if [ -z "$js_asset" ]; then
+            echo "No built JavaScript asset found for post-deploy verification" >&2
+            exit 1
+          fi
+          js_asset="${js_asset#dist/ui/}"
+
+          # Strip source maps from the Pages artifact so they don't reach the
+          # public CDN. Sentry has already fetched what it needs.
+          while IFS= read -r rel; do
+            rm -f "dist/ui/${rel}"
+          done < "$source_map_manifest"
+          if find dist/ui/assets -type f -name '*.map' -print -quit | grep -q .; then
+            echo "Source maps remain in dist/ui/assets after removal" >&2
+            find dist/ui/assets -type f -name '*.map' >&2
+            exit 1
+          fi
+
+          # --branch=qa is a Pages deploy label, not a git ref — it matches
+          # production_branch on the cycloid-ui-qa Pages project so every
+          # deploy aliases to qa.app.trycycloid.com regardless of which git
+          # ref was built.
+          npx wrangler pages deploy dist/ui/ \
+            --project-name=cycloid-ui-qa \
+            --branch=qa
+
+          # --- Post-deploy verification ---
+          # Mirrors the prod gates (deploy.yml) but targets qa.app.trycycloid.com.
+          # Polls with retries because the edge takes a few seconds to pick up a
+          # fresh deploy.
+          origin="https://qa.app.trycycloid.com"
+
+          verify_source_maps_private() {
+            local tmp_dir
+            tmp_dir="$(mktemp -d)"
+            local failed=0
+            # A fresh Pages deploy can serve a bare 403 (no cache-control: no-store)
+            # from the Cloudflare WAF/auth edge for up to ~90s while the new
+            # deployment and its header rules propagate. Poll until the deadline
+            # instead of racing a fixed attempt count; the assertion (403/404 +
+            # no-store) is unchanged, only observed once propagation settles.
+            local max_seconds=180
+            local deadline=$((SECONDS + max_seconds))
+
+            while IFS= read -r rel; do
+              local headers="${tmp_dir}/headers"
+              local status="000"
+              local cache_control=""
+              local verified=0
+
+              while [ "$SECONDS" -lt "$deadline" ]; do
+                : > "$headers"
+                echo "Verifying private source map ${origin}/${rel}"
+                status="$(curl -sS --connect-timeout 5 --max-time 10 --retry 1 --retry-all-errors --retry-delay 2 \
+                  -D "$headers" -o /dev/null -w "%{http_code}" "${origin}/${rel}")" || status="000"
+                cache_control="$(grep -i '^cache-control:' "$headers" | tail -n 1 | tr -d '\r' || true)"
+                echo "Source map verification status=${status} cache_control=${cache_control:-missing}"
+
+                if { [ "$status" = "403" ] || [ "$status" = "404" ]; } \
+                  && grep -iq '^cache-control:.*no-store' "$headers"; then
+                  verified=1
+                  break
+                fi
+
+                sleep 5
+              done
+
+              if [ "$verified" -ne 1 ]; then
+                if [ "$status" != "403" ] && [ "$status" != "404" ]; then
+                  echo "Expected ${origin}/${rel} to return 403 or 404, got ${status}" >&2
+                fi
+                if ! grep -iq '^cache-control:.*no-store' "$headers"; then
+                  echo "Expected ${origin}/${rel} to include cache-control: no-store" >&2
+                fi
+                echo "Timed out after ${max_seconds}s verifying QA UI source maps are private" >&2
+                failed=1
+                break
+              fi
+            done < "$source_map_manifest"
+
+            rm -rf "$tmp_dir"
+            return "$failed"
+          }
+
+          verify_js_asset_public() {
+            local headers
+            local status="000"
+            local cache_control=""
+            # Match the source-map gate's window: the same deploy propagation that
+            # delays the private-map response also delays the public JS asset.
+            local max_seconds=120
+            local deadline=$((SECONDS + max_seconds))
+            headers="$(mktemp)"
+
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              : > "$headers"
+              echo "Verifying public JS asset ${origin}/${js_asset}"
+              status="$(curl -sS --connect-timeout 5 --max-time 10 --retry 1 --retry-all-errors --retry-delay 2 \
+                -D "$headers" -o /dev/null -w "%{http_code}" "${origin}/${js_asset}")" || status="000"
+              cache_control="$(grep -i '^cache-control:' "$headers" | tail -n 1 | tr -d '\r' || true)"
+              echo "JS asset verification status=${status} cache_control=${cache_control:-missing}"
+
+              if [ "$status" = "200" ] && grep -iq '^cache-control:.*public' "$headers"; then
+                rm -f "$headers"
+                return 0
+              fi
+
+              sleep 5
+            done
+
+            if [ "$status" != "200" ]; then
+              echo "Expected ${origin}/${js_asset} to return 200, got ${status}" >&2
+            fi
+            if ! grep -iq '^cache-control:.*public' "$headers"; then
+              echo "Expected ${origin}/${js_asset} to remain publicly cacheable" >&2
+            fi
+            echo "Timed out after ${max_seconds}s verifying QA built JS asset is public" >&2
+            rm -f "$headers"
+            return 1
+          }
+
+          verify_source_maps_private
+          verify_js_asset_public
+        if: ${{ inputs.environment == 'qa' }}
+      - name: Print deployed UI URL
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          DEPLOY_REF: ${{ inputs.ref }}
+          DEPLOYED_SHA: ${{ steps.deployed_sha.outputs.sha }}
+          DEPLOY_ORIGIN: ${{ steps.target.outputs.origin }}
+          ENV_TAG: ${{ steps.target.outputs.env_tag }}
+        run: |-
+          # Preserve the exact prod/qa messages; only alternate targets (env_tag
+          # other than the env default) use the generic label + resolved origin.
+          if [ "$DEPLOY_ENV" = "qa" ] && [ "$ENV_TAG" = "qa" ]; then
+            echo "QA frontend deployed from $DEPLOY_REF ($DEPLOYED_SHA)"
+            echo "URL: https://qa.app.trycycloid.com"
+          elif [ "$DEPLOY_ENV" = "production" ] && [ "$ENV_TAG" = "production" ]; then
+            echo "Production frontend deployed from $DEPLOY_REF ($DEPLOYED_SHA)"
+            echo "URL: https://app.trycycloid.com"
+          else
+            echo "${ENV_TAG} frontend deployed from $DEPLOY_REF ($DEPLOYED_SHA)"
+            echo "URL: ${DEPLOY_ORIGIN}"
+          fi
+      - name: Notify Slack
+        if: ${{ !cancelled() && inputs.notify_slack != false }}
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ steps.deployed_sha.outputs.sha }}
+          REPO: ${{ github.repository }}
+          JOB_STATUS: ${{ job.status }}
+          SERVICE_NAME: ${{ inputs.environment == 'qa' && 'QA UI' || 'PROD UI' }}
+          ENV_TAG: ${{ steps.target.outputs.env_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+          # Relabel only for alternate targets (env_tag not production/qa); prod
+          # and qa keep the exact "PROD UI" / "QA UI" label.
+          if [ "$ENV_TAG" != "production" ] && [ "$ENV_TAG" != "qa" ]; then
+            SERVICE_NAME="$(printf '%s' "$ENV_TAG" | tr '[:lower:]' '[:upper:]') UI"
+          fi
+          if [ "$JOB_STATUS" = "success" ]; then
+            EMOJI=":white_check_mark:"
+            STATUS="succeeded"
+          else
+            EMOJI=":x:"
+            STATUS="failed"
+          fi
+          SHORT_SHA="${SHA::7}"
+          SUBJECT="$(git log -1 --format=%s "$SHA" 2>/dev/null || true)"
+          if [ -z "$SUBJECT" ] && [ -n "$HEAD_COMMIT_MESSAGE" ]; then
+            SUBJECT="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          fi
+          SUBJECT="$(printf '%s' "$SUBJECT" | cut -c1-72)"
+          SUBJECT="$(printf '%s' "$SUBJECT" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+          if [ "$JOB_STATUS" != "success" ]; then
+            MENTION="$(bash scripts/deploy-slack-mention.sh "$ACTOR" 2>/dev/null || echo " cc <@U0AHT782S65> <@U0AHJCUSM70>")"
+          else
+            MENTION=""
+          fi
+          PAYLOAD=$(jq -n --arg text "${EMOJI} *deploy ${STATUS}* · ${SERVICE_NAME} · ${SUBJECT} · ${ACTOR} · <https://github.com/${REPO}/commit/${SHA}|${SHORT_SHA}> · <${RUN_URL}|run>${MENTION}" '{text: $text}')
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"

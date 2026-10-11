@@ -1,0 +1,38 @@
+{
+  "snapshotId": "sh-oqd4vrtk2araj4vj90io",
+  "builtAt": "2026-07-08T06:38:00Z",
+  "bakedFiles": {
+    "apps/sandbox-e2b/cycloid-record-demo.mjs": "2425d2bcce34bd8a57a57f98ef6fa9e66e043002bac32e18d1294c52726aef3b",
+    "apps/sandbox-e2b/cycloid-recorder.mjs": "ab7966291796850cfbbe52eb69c0e9c0b3a55b704ffee5a825b6f23cb4ac7790",
+    "apps/sandbox-e2b/curl-egress-wrapper.sh": "d244097dcc777a53a54b008209a36bd61d606037354732f3f85a180a5a17f5ec",
+    "apps/sandbox-e2b/enforce-egress.sh": "1f0ded1f79c3a44b838ab8aab043be16d3aaceee3ee36b13ef82e9db2dc0f485",
+    "apps/sandbox-e2b/gh-command-wrapper.sh": "65cb1ae0229799d2a55d34b2ff737323dd10ca085eca8188fcc2c57f1a468896",
+    "apps/sandbox-e2b/git-command-wrapper.sh": "28054ba9f89dc428c0cbd0f691d7991bd9ba54e09ce3ed90b63546af68cd843f",
+    "apps/sandbox-e2b/github-meta-cidrs.snapshot": "8390c3848d5c21021ffe45e4528376326b64df992be5d4763f5ffbd31992418d",
+    "apps/sandbox-e2b/ready-check.sh": "38264b970c5665cdbe5bd14da3fdb10e71025101e7257b26220f7f0e8e985bb5",
+    "apps/sandbox-e2b/scripts/cycloid-app": "a9da4aeea75b7737984c8648f534a6c94ddff22ffdf9b2d1fa0f5b5a8ece70de",
+    "apps/sandbox-e2b/scripts/cycloid-docker-preview": "1d451fc1a053c520af3296b6b233b8b0dcbaa271dc89450495a5530ab8337be6",
+    "apps/sandbox-e2b/scripts/repo-context.sh": "21d1b1040380505241cd9a33b31efc18ff066290d595dc6bd055ace7679ce6ea",
+    "apps/sandbox-e2b/scripts/start-dockerd.sh": "b55a36833da540604f69d05b8e1e9fb3b352320eccf949ea1cdbd0b62bd5b1f1"
+  },
+  "pinnedVersions": {
+    "codexCli": "0.129.0",
+    "opencodeCli": "1.17.11",
+    "opencodeSdk": "1.17.11",
+    "claudeAgentSdk": "0.3.170",
+    "cycloidCli": "0.1.125",
+    "sharp": "^0.34.5",
+    "just": "1.51.0",
+    "playwright": "1.59.0",
+    "agentBrowser": "0.28.0",
+    "preCommit": "4.6.0",
+    "typescript": "5.9.3",
+    "terraform": "1.15.7",
+    "googleFontsCommit": "e4572de925a4c3be12f1f9983ee0adbe1eb6e9fe",
+    "geistFontCommit": "10dc7658f13c38a474cde201bb09a4617267545b"
+  },
+  "bundle": {
+    "sha256": "7af79923be2852b06f8c15549d60458fc819988f80bc590ec5625fd00b7b0b60",
+    "bytes": 9239512
+  }
+}

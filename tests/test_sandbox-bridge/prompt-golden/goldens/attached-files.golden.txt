@@ -1,0 +1,7 @@
+<attached_files>
+The user has pointed you at these files/directories as relevant context.
+Use your Read, Grep, and Glob tools to examine them as needed.
+
+- src/index.ts
+- docs/architecture.md
+</attached_files>

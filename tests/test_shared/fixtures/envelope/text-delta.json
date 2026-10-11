@@ -1,0 +1,16 @@
+{
+  "phase": "text.delta",
+  "timestampMs": 1760000000300,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "channel": "output",
+    "text": "I updated the guardrail test.",
+    "partId": "text-1",
+    "bridgeEventType": "text",
+    "bridgeData": {
+      "streamId": "stream-output"
+    }
+  }
+}

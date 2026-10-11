@@ -1,0 +1,6 @@
+version: 1
+layer:
+  dockerfile: .cycloid/sandbox.layer.Dockerfile
+smoke:
+  commands:
+    - ["bash", "-lc", "command -v git && command -v python3"]

@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist"
+  },
+  "include": ["**/*.ts", "shared/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    ".tmp",
+    "tmp",
+    "apps/ui",
+    "apps/control-plane-worker",
+    "apps/sandbox-bridge",
+    "apps/cli",
+    "apps/status-worker",
+    "tools",
+    "tests/test_sandbox-bridge",
+    "tests/test_cloudflare",
+    "tests/test_workerd",
+    "tests/test_status-worker",
+    "tests/smoke"
+  ]
+}

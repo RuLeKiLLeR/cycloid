@@ -1,0 +1,132 @@
+{
+  "name": "cycloid_2",
+  "version": "1.0.0",
+  "description": "test",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "packageManager": "npm@10.9.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "ui": "npm run -w cycloid-ui dev",
+    "test": "vitest run",
+    "test:workerd": "vitest run --config vitest.workerd.config.ts",
+    "test:reconnect-local": "vitest run tests/test_cloudflare/session/auto-close-on-disconnect.test.ts tests/test_cloudflare/session/broadcast-before-persist.test.ts tests/test_cloudflare/session/websocket-protocol.test.ts tests/test_ui/websocket-hook.test.tsx tests/test_ui/session-detail-actions.test.tsx",
+    "test:e2e": "playwright test",
+    "typecheck": "concurrently -g --kill-others-on-fail -n workflows,root,cli,control,ui,bridge,status \"node scripts/typecheck-workflows.mjs\" \"tsc --noEmit\" \"npm run -w @trycycloid/cli typecheck\" \"npm run -w @cycloid/control-plane-worker typecheck\" \"npm run -w cycloid-ui typecheck\" \"npm run -w @cycloid/sandbox-bridge typecheck\" \"npm run -w @cycloid/status-worker typecheck\"",
+    "dev:api": "bash scripts/dev-api.sh",
+    "dev:ui": "bash scripts/dev-ui.sh",
+    "dev:tunnel": "bash scripts/dev-tunnel.sh",
+    "dev:full": "bash scripts/dev-full.sh",
+    "dev:env": "node scripts/dev-env.mjs",
+    "dogfood:prepare": "node scripts/dogfood-prepare.mjs",
+    "dogfood:preflight": "node scripts/dogfood-preflight.mjs",
+    "dogfood:e2e": "bash scripts/dogfood-e2e.sh",
+    "cycloid:auth": "node scripts/cycloid-auth.mjs",
+    "db:migrate:local": "bash scripts/db-migrate-local.sh",
+    "build:ui": "npm run -w cycloid-ui build",
+    "inspect:ui-public-artifact": "node scripts/inspect-ui-public-artifact.mjs",
+    "audit:frontend": "node scripts/frontend-audit/audit.mjs",
+    "bundle:sandbox-core-apps": "npm run -w @cycloid/sandbox-bridge bundle",
+    "build": "npm run build:ui",
+    "security:unauth-exposure": "node scripts/unauthenticated-exposure-check.mjs",
+    "verify:ui": "npm run build:ui && npm run security:unauth-exposure -- --dist dist/ui --strict-assets",
+    "verify:all": "concurrently -g --kill-others-on-fail -n typecheck,test,ui \"npm run typecheck\" \"npm run test -- --maxWorkers=2\" \"npm run verify:ui\"",
+    "check:developer-paths": "node scripts/check-developer-absolute-paths.mjs",
+    "test:unauth-exposure": "npm run build:ui && npm run security:unauth-exposure -- --dist dist/ui && npx vitest run tests/test_cloudflare/unauthenticated-exposure.test.ts",
+    "guard:bridge-llm": "bash apps/sandbox-bridge/scripts/guard-bridge-llm.sh",
+    "guard:pr-coordination-writers": "bash scripts/guard-pr-coordination-writers.sh",
+    "lint": "npm run guard:bridge-llm && npm run guard:pr-coordination-writers && npm run check:developer-paths && eslint --fix --cache --cache-location node_modules/.cache/eslint/ .",
+    "lint:changed": "bash scripts/lint-changed-ts.sh",
+    "test:changed": "base=\"${BRANCH:-$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD | sed 's#^origin/##')}\"; npx vitest run \"--changed=origin/${base:-main}\" --passWithNoTests",
+    "typecheck:changed": "node scripts/typecheck-changed.mjs",
+    "verify:changed": "concurrently -g --kill-others-on-fail -n lint,test,typecheck,force-tests \"npm run lint:changed\" \"vitest run --changed origin/main --passWithNoTests\" \"npm run typecheck:changed\" \"node scripts/force-run-tests.mjs\"",
+    "verify:git-hooks": "bash scripts/verify-git-hooks.sh",
+    "format": "prettier --write . --ignore-unknown",
+    "format:check": "prettier --check . --ignore-unknown",
+    "prepare": "node scripts/prepare-local.mjs",
+    "build:e2b-template": "bash scripts/e2b-template-build.sh",
+    "deploy:e2b:sandbox": "bash scripts/e2b-template-build.sh --prod --include-repo-spec-templates",
+    "deploy:e2b:sandbox:qa": "bash scripts/e2b-template-build.sh --qa --include-repo-spec-templates",
+    "smoke:prod:pr-creation": "tsx scripts/prod-pr-creation-smoke.ts",
+    "smoke:prod:claude-verify": "tsx scripts/prod-pr-creation-smoke.ts --model claude-opus-4-8 --auto-verify --require-verdict",
+    "qa:seed": "tsx scripts/qa-seed.ts",
+    "qa:integration-health": "tsx scripts/qa-integration-health.ts",
+    "smoke:qa-recorder": "tsx scripts/qa-recorder-smoke.ts",
+    "smoke:qa:memory-context-vector": "tsx scripts/memory-context-vector-smoke.ts --env qa",
+    "smoke:qa:dummy-app": "tsx scripts/verify-e2b-session.ts --base-url https://qa.app.trycycloid.com --repo-owner trycycloid --repo-name dummy-docker-app",
+    "smoke:e2b:compat": "tsx scripts/e2b-compat-smoke.ts",
+    "smoke:e2b:egress": "tsx scripts/e2b-egress-smoke.ts",
+    "smoke:e2b:worker-bundle": "node scripts/e2b-worker-bundle-smoke.mjs",
+    "smoke:e2b:terraform": "node scripts/e2b-smoke-terraform.mjs",
+    "verify:e2b-session": "tsx scripts/verify-e2b-session.ts",
+    "eval:plan-necessity": "tsx scripts/plan-necessity-eval.ts",
+    "export:agent-traces": "tsx scripts/export-agent-traces.ts",
+    "baseline:e2b": "tsx scripts/e2b-baseline-matrix.ts",
+    "debug:e2b:sandbox": "tsx scripts/e2b-sandbox-debug.ts",
+    "business:offboard": "tsx scripts/offboard-business.ts",
+    "cli": "tsx apps/cli/src/index.ts"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "prettier --write",
+      "eslint --fix"
+    ],
+    "*.{js,jsx,cjs,mjs,json,md,yml,yaml,css,html}": "prettier --write"
+  },
+  "overrides": {
+    "eslint-plugin-jsx-a11y": {
+      "eslint": "$eslint"
+    },
+    "form-data": "4.0.6"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trycycloid/cycloid.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/trycycloid/cycloid/issues"
+  },
+  "homepage": "https://github.com/trycycloid/cycloid#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@slack/web-api": "^7.8.0",
+    "freestyle": "^0.1.63",
+    "smol-toml": "^1.7.0",
+    "tsx": "^4.21.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "@cloudflare/vitest-pool-workers": "^0.18.0",
+    "@cloudflare/workers-types": "^4.20260307.1",
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.61.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.1.0",
+    "@typescript-eslint/eslint-plugin": "^8.62.1",
+    "@typescript-eslint/parser": "^8.57.0",
+    "better-sqlite3": "^12.11.1",
+    "concurrently": "^10.0.3",
+    "eslint": "^10.6.0",
+    "eslint-plugin-jsx-a11y": "^6.10.2",
+    "eslint-plugin-simple-import-sort": "^12.1.1",
+    "eslint-plugin-unused-imports": "^4.4.1",
+    "happy-dom": "^20.10.6",
+    "husky": "^9.1.7",
+    "jest-axe": "^10.0.0",
+    "lint-staged": "^16.3.2",
+    "prettier": "3.9.4",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9",
+    "wrangler": "^4.107.0",
+    "yaml": "^2.8.3"
+  }
+}

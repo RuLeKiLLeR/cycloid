@@ -1,0 +1,38 @@
+{
+  "name": "@trycycloid/cli",
+  "version": "0.1.199",
+  "description": "CLI for Cycloid — create and manage coding agent sessions",
+  "type": "module",
+  "bin": {
+    "cycloid": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trycycloid/cycloid.git",
+    "directory": "apps/cli"
+  },
+  "homepage": "https://www.trycycloid.com",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.1.0",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.9.3"
+  }
+}

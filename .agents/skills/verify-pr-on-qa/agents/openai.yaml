@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify PR On QA"
+  short_description: "Validate PR behavior in QA"
+  default_prompt: "Use $verify-pr-on-qa to verify this PR, branch, or local change in QA before merge: <PR URL, PR number, branch, or local>"

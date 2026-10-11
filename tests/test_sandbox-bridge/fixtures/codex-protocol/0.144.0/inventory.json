@@ -1,0 +1,19 @@
+{
+  "codexCliVersion": "0.144.0",
+  "itemTypes": ["agentMessage", "commandExecution", "fileChange", "reasoning", "userMessage"],
+  "notifications": [
+    "account/rateLimits/updated",
+    "item/agentMessage/delta",
+    "item/completed",
+    "item/started",
+    "mcpServer/startupStatus/updated",
+    "remoteControl/status/changed",
+    "thread/started",
+    "thread/status/changed",
+    "thread/tokenUsage/updated",
+    "turn/completed",
+    "turn/diff/updated",
+    "turn/started"
+  ],
+  "serverRequests": []
+}

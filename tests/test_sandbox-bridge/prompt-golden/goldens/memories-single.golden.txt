@@ -1,0 +1,7 @@
+# Engineering Memories
+
+These are learned patterns from past work. Apply when relevant. Retrieval used structured relevance scoring.
+## db-access
+Type: convention
+
+Database access is D1-only via prepared statements in DAO functions.

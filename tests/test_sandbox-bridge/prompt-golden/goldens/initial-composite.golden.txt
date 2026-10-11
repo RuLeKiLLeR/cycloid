@@ -1,0 +1,14 @@
+# Requesting user identity
+
+Treat "Grace Hopper" as the requesting user's identity unless the task explicitly indicates otherwise.
+
+<skill_directives>
+Follow the /deploy skill: run the deploy checklist before pushing.
+</skill_directives>
+
+<attached_files>
+The user has pointed you at these files/directories as relevant context.
+Use your Read, Grep, and Glob tools to examine them as needed.
+
+- README.md
+</attached_files>

@@ -1,0 +1,36 @@
+{
+  "schema_version": "memory_review_bot_fixture_v1",
+  "fixture_id": "synthetic-false-negative-missed-memory",
+  "fixture_source": "synthetic",
+  "prompt": {
+    "session_id": "synthetic-session-false-negative",
+    "prompt_id": "synthetic-prompt-false-negative",
+    "task_summary": "A relevant known memory should have guided replay pagination, but no memory was returned.",
+    "bounded_prompt": "Change session event replay page sizing without breaking websocket replay bootstrap behavior.",
+    "outcome_summary": "No memory was returned even though existing memory guidance directly covered replay limit separation."
+  },
+  "returned_memories": [],
+  "evidence": [
+    {
+      "evidence_id": "ev_prompt_replay_limits",
+      "kind": "prompt",
+      "snippet": "The prompt asked to change replay page sizing while preserving websocket bootstrap behavior."
+    },
+    {
+      "evidence_id": "ev_existing_memory_replay_contract",
+      "kind": "memory",
+      "snippet": "Existing memory mem-replay-pagination-guard says HTTP replay limits and websocket replay windows are intentionally separate and must not be unified."
+    },
+    {
+      "evidence_id": "ev_output_unified_limits",
+      "kind": "output",
+      "snippet": "The produced patch unified the replay limits, creating the exact regression the missing memory warned against."
+    }
+  ],
+  "expected": {
+    "prompt_outcome": "false_negative",
+    "evidence_ids": ["ev_prompt_replay_limits", "ev_existing_memory_replay_contract", "ev_output_unified_limits"],
+    "missed_memory_ids": ["mem-replay-pagination-guard"],
+    "memory_results": []
+  }
+}

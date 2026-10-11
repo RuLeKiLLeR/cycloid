@@ -1,0 +1,30 @@
+{
+  "schema_version": "memory_review_bot_fixture_v1",
+  "fixture_id": "synthetic-true-negative-no-memory",
+  "fixture_source": "synthetic",
+  "prompt": {
+    "session_id": "synthetic-session-true-negative",
+    "prompt_id": "synthetic-prompt-true-negative",
+    "task_summary": "A routine typo fix completes with no returned memory and no memory should be credited.",
+    "bounded_prompt": "Fix the misspelled word in docs/help.md.",
+    "outcome_summary": "The final change corrected only the typo; there was no memory recall and no evidence memory helped."
+  },
+  "returned_memories": [],
+  "evidence": [
+    {
+      "evidence_id": "ev_prompt_typo",
+      "kind": "prompt",
+      "snippet": "The task was a one-word documentation typo fix."
+    },
+    {
+      "evidence_id": "ev_output_typo_done",
+      "kind": "output",
+      "snippet": "The output reported only the typo correction and a passing docs check."
+    }
+  ],
+  "expected": {
+    "prompt_outcome": "true_negative",
+    "evidence_ids": ["ev_prompt_typo", "ev_output_typo_done"],
+    "memory_results": []
+  }
+}

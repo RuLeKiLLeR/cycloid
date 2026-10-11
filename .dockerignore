@@ -1,0 +1,31 @@
+# Keeps the docker build context small for the dogfood UI image.
+# Without this, `docker compose build` from the repo root uploads the
+# entire monorepo (.git, every workspace's node_modules, dist, etc.) to
+# the daemon — slow enough that cycloid-app start can time out before
+# the ready check passes.
+
+.git
+.github
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+.turbo
+**/.turbo
+coverage
+**/coverage
+.wrangler
+**/.wrangler
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+
+# Local dev artifacts
+*.log
+.env
+.env.local
+.env.*.local
+.DS_Store

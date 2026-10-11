@@ -1,0 +1,52 @@
+{
+  "schema_version": "memory_review_bot_fixture_v1",
+  "fixture_id": "superseded-memory-filtered",
+  "fixture_source": "production",
+  "prompt": {
+    "session_id": "production-bootstrap-positive-now-superseded",
+    "prompt_id": "production-bootstrap-feedback",
+    "task_summary": "A previously positive bootstrap memory is now superseded and should not be credited as active guidance.",
+    "bounded_prompt": "Use current memory guidance only; do not rely on superseded historical bootstrap facts.",
+    "outcome_summary": "The fixture models lifecycle hygiene: the memory may once have been useful, but it is superseded at review time."
+  },
+  "returned_memories": [
+    {
+      "memory_id": "mf_5389b4a2d425918bd989e40e2371f4d88a1111bc0b5c6b27ca3b96d90bc5ad61",
+      "source": "company_bootstrap",
+      "rank": 1,
+      "score": 0.83,
+      "lifecycle_state": "superseded",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Historical bootstrap guidance that has since been superseded by newer repo-memory behavior."
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "ev_lifecycle_superseded",
+      "kind": "lifecycle",
+      "source_ref": "memory review bot milestone 1 data findings",
+      "snippet": "The one positive bootstrap example found is now superseded and should not be reused as an active true-positive fixture."
+    },
+    {
+      "evidence_id": "ev_prompt_current_guidance",
+      "kind": "prompt",
+      "snippet": "The review should judge current applicability, not historical usefulness before supersession."
+    }
+  ],
+  "expected": {
+    "prompt_outcome": "false_positive",
+    "evidence_ids": ["ev_lifecycle_superseded", "ev_prompt_current_guidance"],
+    "memory_results": [
+      {
+        "memory_id": "mf_5389b4a2d425918bd989e40e2371f4d88a1111bc0b5c6b27ca3b96d90bc5ad61",
+        "relevance": "borderline",
+        "usefulness": "not_useful",
+        "effect": "neutral",
+        "lifecycle_state": "superseded",
+        "root_causes": ["stale_memory", "supersession_missing"],
+        "evidence_ids": ["ev_lifecycle_superseded"],
+        "rationale": "A superseded memory should be filtered or diagnosed as stale instead of credited."
+      }
+    ]
+  }
+}

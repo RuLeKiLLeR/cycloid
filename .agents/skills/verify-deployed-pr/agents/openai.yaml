@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify Deployed PR"
+  short_description: "Validate deployed PR behavior"
+  default_prompt: "Use $verify-deployed-pr to verify this PR using a fresh Cycloid CLI session and observability evidence."

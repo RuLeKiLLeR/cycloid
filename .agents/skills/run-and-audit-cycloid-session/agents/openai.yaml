@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run And Audit Cycloid Session"
+  short_description: "Run a Cycloid session from a Linear ticket, then audit it"
+  default_prompt: "Use $run-and-audit-cycloid-session to take a Linear ticket, create the corresponding Cycloid session, wait for completion and PR outcome, then audit what happened in the session."

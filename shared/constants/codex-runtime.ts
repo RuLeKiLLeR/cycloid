@@ -1,0 +1,1 @@
+export const PINNED_CODEX_CLI_VERSION = "0.144.0";

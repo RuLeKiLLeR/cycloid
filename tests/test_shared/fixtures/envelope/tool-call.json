@@ -1,0 +1,19 @@
+{
+  "phase": "tool.call",
+  "timestampMs": 1760000000400,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "callId": "tool-1",
+    "tool": "exec_command",
+    "summary": "Run focused tests",
+    "args": {
+      "cmd": "npx vitest run tests/test_cloudflare/wrangler-public-vars.test.ts"
+    },
+    "bridgeEventType": "tool_call",
+    "bridgeData": {
+      "status": "running"
+    }
+  }
+}

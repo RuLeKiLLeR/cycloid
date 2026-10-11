@@ -1,0 +1,58 @@
+S Watchers & Scheduling, Verification (Contract and or Mobile), INcident Investigation, Memory/COmpany Context, Enterprise Control Centre
+
+A
+
+B
+
+C Project Work Graph, Babysitter/Review Loop, Skill/Runtime Authority, Code Reviewer
+
+
+
+Watchers & Scheduling
+1A User Defined Schedules
+1B Proactive Schedules -> Requires into Memory
+
+Verification
+- evidence as first class citizen
+- currently rigid/specific, generalize more effectively
+- modify egress rules per repo/sandbox
+- PR body needs work
+- Artifact/Trace/Workspace Inspector
+
+Incident Investigation
+- More analytical
+- Does more queries
+- RCA vs reading stuff
+- More prompt engineering than code
+- Runbook by company
+- Integrations
+- Maybe look at what the more dedicated AI SRE companies are offering here
+
+Memory (Create, Utilize, Refine)
+- Fold in similar sessions
+Create
+- Pull Company Context / Memory from outside of PRs
+    - subitem to figure out this looks like more concretely
+Utilize
+- 
+
+Enterprise Control Center
+- Per Sessions Auditing
+- Audit Logs
+- 
+
+
+Project WOrk Graph
+- Super greenfield
+
+Review Loop
+- If someone wants it, we turn the flag on (figure out how to do it on a policy basis)
+- AUto enable for low blast radius changes or something idk
+
+Runtime Authority
+- Plugins / secutity / RBAC type stuff
+- Make sure that agent behavior and user permissions are aligned
+- Ramp Dojo type thing
+
+Code REviewer
+- TBD

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Backward-compat shim — `cycloid-docker-preview [--timeout N --contract-out P]`
+# now delegates to `cycloid-app start`. Existing callers (sandbox-bridge,
+# legacy cycloid-verify-ui paths) keep working unchanged during the cutover.
+set -euo pipefail
+exec "$(dirname "$0")/cycloid-app" start "$@"

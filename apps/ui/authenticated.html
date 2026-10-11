@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#000000" />
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="icon" href="/favicon-16.png" sizes="16x16" type="image/png" />
+    <link rel="apple-touch-icon" href="/favicon-180.png" />
+    <link rel="preconnect" href="https://avatars.githubusercontent.com" crossorigin />
+    <link rel="preconnect" href="https://browser-intake-us5-datadoghq.com" crossorigin />
+    <link rel="preconnect" href="https://o4510976731643904.ingest.us.sentry.io" crossorigin />
+    <link rel="modulepreload" href="/src/main.tsx" />
+    <!-- AUTHENTICATED_FONT_PRELOAD -->
+    <title>Cycloid</title>
+    <style>
+      /* FOUC guard mirrors --color-surface-0 / --color-text-primary from App.css
+         @theme. The app is dark-only, so first paint hardcodes the dark palette
+         before App.css loads — no theme branch, no runtime switch, no flash. */
+      html,
+      body {
+        background: #000000;
+        color: #f5f5f5;
+        color-scheme: dark;
+      }
+      body {
+        font-family: "Geist Variable", "Geist", "Helvetica Neue", Arial, sans-serif;
+      }
+    </style>
+    <script>
+      (() => {
+        const reloadKey = "stale-chunk-reload";
+        const reloadOnce = () => {
+          if (sessionStorage.getItem(reloadKey)) return;
+          sessionStorage.setItem(reloadKey, "1");
+          window.location.reload();
+        };
+
+        window.addEventListener(
+          "error",
+          (event) => {
+            const target = event.target;
+            if (!target || typeof target !== "object") return;
+
+            const node = target;
+            const tagName = node.tagName?.toLowerCase();
+            const assetUrl = tagName === "link" ? node.href : tagName === "script" ? node.src : null;
+            if (!assetUrl) return;
+
+            try {
+              const url = new URL(assetUrl, window.location.href);
+              if (url.origin === window.location.origin && url.pathname.startsWith("/assets/")) reloadOnce();
+            } catch {
+              // Ignore malformed URLs and leave normal browser error handling intact.
+            }
+          },
+          true,
+        );
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

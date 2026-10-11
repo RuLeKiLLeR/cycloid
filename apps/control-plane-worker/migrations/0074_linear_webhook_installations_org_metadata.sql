@@ -1,0 +1,2 @@
+ALTER TABLE linear_webhook_installations ADD COLUMN linear_organization_name TEXT;
+ALTER TABLE linear_webhook_installations ADD COLUMN linear_organization_url_key TEXT;

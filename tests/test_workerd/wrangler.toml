@@ -1,0 +1,24 @@
+name = "cycloid-workerd-tests"
+main = "./worker.ts"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
+
+[[durable_objects.bindings]]
+name = "TEST_SESSION_STORAGE"
+class_name = "TestSessionStorageDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionDO", "TestSessionStorageDO"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cycloid-workerd-tests"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[[queues.consumers]]
+queue = "cycloid-traces"

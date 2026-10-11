@@ -1,0 +1,14 @@
+name = "cycloid-status"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+workers_dev = false
+logpush = false
+
+# Intentionally no D1, Durable Objects, queues, secrets, or control-plane
+# bindings. This worker must stay independent of the app's fault domain so it
+# can report "down" when the app is down.
+
+[[kv_namespaces]]
+binding = "STATUS_FLAG"
+id = "7dad13d35f664f7e888a408dd35ac692"
+preview_id = "e2d96b0bbd9741ec9678c0e6a260c5ef"

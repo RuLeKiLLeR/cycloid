@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#111110" />
+    <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="icon" href="/favicon-16.png" sizes="16x16" type="image/png" />
+    <link rel="apple-touch-icon" href="/favicon-180.png" />
+    <link rel="preconnect" href="https://browser-intake-us5-datadoghq.com" crossorigin />
+    <link rel="preconnect" href="https://o4510976731643904.ingest.us.sentry.io" crossorigin />
+    <link rel="modulepreload" href="/src/public-main.ts" />
+    <script type="module" src="/src/font-preload.ts"></script>
+    <title>Sign in — Cycloid</title>
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        min-height: 100dvh;
+      }
+
+      body {
+        margin: 0;
+        background: #111110;
+        color: #ededec;
+        font-family:
+          "Inter Tight Variable",
+          "Inter Tight",
+          system-ui,
+          -apple-system,
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        color-scheme: dark;
+      }
+
+      .public-shell {
+        position: relative;
+        display: flex;
+        min-height: 100%;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        padding: 24px;
+        background: #111110;
+      }
+
+      .public-shell__frame {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        justify-content: center;
+        width: min(100%, 280px);
+        animation: public-shell-rise 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+      }
+
+      .public-shell__actions {
+        display: flex;
+        width: 100%;
+      }
+
+      .public-shell__control {
+        position: relative;
+        display: inline-flex;
+        min-width: 240px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        border: 0;
+        /* Sharp corners — the 0px-radius brand signature carries into the login shell. */
+        border-radius: 0;
+        background: #ededec;
+        color: #111110;
+        cursor: pointer;
+        font:
+          500 13px/1.2 "Inter Tight Variable",
+          "Inter Tight",
+          system-ui,
+          -apple-system,
+          sans-serif;
+        padding: 16px 20px;
+        text-decoration: none;
+        transition:
+          background 200ms ease,
+          opacity 200ms ease;
+        touch-action: manipulation;
+      }
+
+      .public-shell__control:hover {
+        background: #d4d3cf;
+      }
+
+      .public-shell__control[aria-disabled="true"] {
+        cursor: default;
+        opacity: 0.7;
+        pointer-events: none;
+      }
+
+      .public-shell__icon {
+        flex: none;
+        transition:
+          transform 200ms ease,
+          opacity 200ms ease;
+      }
+
+      .public-shell__control:hover .public-shell__icon {
+        transform: translateX(4px);
+      }
+
+      .public-shell__control[aria-disabled="true"] .public-shell__icon {
+        opacity: 0.7;
+      }
+
+      .public-shell__progress {
+        position: absolute;
+        inset-inline: 0;
+        bottom: 0;
+        height: 1px;
+        background: rgb(17 17 16 / 70%);
+        opacity: 0;
+      }
+
+      .public-shell__progress[data-visible="true"] {
+        animation: public-shell-pulse 1.2s ease-in-out infinite;
+      }
+
+      .public-shell__control:focus-visible {
+        outline: 1px solid #ededec;
+        outline-offset: 3px;
+        box-shadow: 0 0 0 3px rgb(237 236 236 / 0.18);
+      }
+
+      @media (max-width: 640px) {
+        .public-shell {
+          padding: 22px;
+        }
+
+        .public-shell__control {
+          width: 100%;
+        }
+      }
+
+      @keyframes public-shell-rise {
+        from {
+          opacity: 0;
+          transform: translateY(12px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @keyframes public-shell-pulse {
+        0%,
+        100% {
+          opacity: 0.35;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .public-shell__frame,
+        .public-shell__progress {
+          animation-duration: 1ms;
+          animation-iteration-count: 1;
+        }
+
+        .public-shell__control,
+        .public-shell__icon {
+          transition-duration: 1ms;
+        }
+      }
+
+      .public-shell__message {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+        text-align: center;
+      }
+      .public-shell__title {
+        font-size: 22px;
+        font-weight: 600;
+        margin: 0;
+        color: #ededec;
+      }
+      .public-shell__body {
+        font-size: 14px;
+        line-height: 1.5;
+        margin: 0;
+        color: #b5b3ad;
+        max-width: 28ch;
+      }
+    </style>
+    <script src="/stale-chunk-reload.js"></script>
+  </head>
+  <body>
+    <div id="root">
+      <main class="public-shell" aria-label="Sign in">
+        <div class="public-shell__frame">
+          <div class="public-shell__actions">
+            <a
+              id="public-auth-link"
+              class="public-shell__control"
+              href="/auth/github"
+              aria-disabled="true"
+              tabindex="-1"
+            >
+              <span id="public-auth-label">Sign in</span>
+              <svg
+                class="public-shell__icon"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <line x1="5" y1="12" x2="19" y2="12"></line>
+                <polyline points="12 5 19 12 12 19"></polyline>
+              </svg>
+              <span id="public-auth-progress" class="public-shell__progress" aria-hidden="true"></span>
+            </a>
+          </div>
+        </div>
+      </main>
+    </div>
+    <script type="module" src="/src/public-main.ts"></script>
+  </body>
+</html>

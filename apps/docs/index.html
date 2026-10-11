@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cycloid Docs</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0b0b0c;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      /* Full-viewport embed of the published Google Doc. */
+      iframe {
+        display: block;
+        border: 0;
+        width: 100%;
+        height: 100vh;
+      }
+      /* Shown only until the Google Doc URL below is filled in. */
+      .placeholder {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        color: #d4d4d8;
+        text-align: center;
+        padding: 24px;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      To publish docs:
+      1. In the Google Doc: File > Share > Publish to web > Publish.
+      2. Copy the published URL (looks like
+         https://docs.google.com/document/d/e/<ID>/pub).
+      3. Paste it into DOC_URL below, appending ?embedded=true, then deploy.
+    -->
+    <script>
+      // Embedded (read-only) view of the Cycloid docs Google Doc.
+      const DOC_URL = "https://docs.google.com/document/d/1fkxcyLrIGAmv99p9Hdf2RguUEPyvm4AcH1pLdrDuHlw/preview";
+
+      if (DOC_URL) {
+        const frame = document.createElement("iframe");
+        frame.src = DOC_URL;
+        frame.title = "Cycloid Docs";
+        document.body.appendChild(frame);
+      } else {
+        const el = document.createElement("div");
+        el.className = "placeholder";
+        el.textContent = "Docs are coming soon. (Set DOC_URL in index.html to a published Google Doc.)";
+        document.body.appendChild(el);
+      }
+    </script>
+  </body>
+</html>

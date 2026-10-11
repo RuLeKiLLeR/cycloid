@@ -1,0 +1,14 @@
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/index.html
+  Cache-Control: no-cache, no-store, must-revalidate
+
+/authenticated.html
+  Cache-Control: no-cache, no-store, must-revalidate
+
+/favicon-*.png
+  Cache-Control: public, max-age=86400
+
+/stale-chunk-reload.js
+  Cache-Control: no-cache, no-store, must-revalidate

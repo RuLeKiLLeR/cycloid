@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reconcile Open Linear Tickets"
+  short_description: "Sweep open Linear tickets for done/canceled status"
+  default_prompt: "Use $reconcile-open-linear-tickets to review open Linear tickets for this repo, compare the current codebase and any linked PRs against ticket intent, and move only clearly resolved tickets to Done or Canceled."

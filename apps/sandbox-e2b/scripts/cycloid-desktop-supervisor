@@ -1,0 +1,1061 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+STATE_DIR="${ARCANIST_DESKTOP_STATE_DIR:-/tmp/cycloid-desktop}"
+PID_DIR="${STATE_DIR}/pids"
+LOG_DIR="${STATE_DIR}/logs"
+LOCK_DIR="${STATE_DIR}/locks"
+HEALTH_PATH="${STATE_DIR}/health.json"
+SUPERVISOR_LOG="${STATE_DIR}/supervisor.log"
+SUPERVISOR_GENERATION_PATH="${STATE_DIR}/supervisor-generation"
+DISPLAY_VALUE="${DISPLAY:-${ARCANIST_DESKTOP_DISPLAY:-:99}}"
+DISPLAY_GEOMETRY="${ARCANIST_DESKTOP_GEOMETRY:-1440x900x24}"
+VNC_PORT="${ARCANIST_DESKTOP_VNC_PORT:-5900}"
+NOVNC_PORT="${ARCANIST_DESKTOP_NOVNC_PORT:-6080}"
+NOVNC_WEB_ROOT="${ARCANIST_DESKTOP_NOVNC_WEB_ROOT:-/usr/share/novnc}"
+RESTART_BUDGET="${ARCANIST_DESKTOP_RESTART_BUDGET:-3}"
+RESTART_WINDOW_SECONDS="${ARCANIST_DESKTOP_RESTART_WINDOW_SECONDS:-300}"
+HEALTH_INTERVAL_SECONDS="${ARCANIST_DESKTOP_HEALTH_INTERVAL_SECONDS:-5}"
+SUPERVISOR_ITERATIONS="${ARCANIST_DESKTOP_SUPERVISOR_ITERATIONS:-0}"
+START_READY_TIMEOUT_SECONDS="${ARCANIST_DESKTOP_START_READY_TIMEOUT_SECONDS:-25}"
+START_READY_POLL_SECONDS="${ARCANIST_DESKTOP_START_READY_POLL_SECONDS:-0.5}"
+LOCK_WAIT_SECONDS="${ARCANIST_DESKTOP_LOCK_WAIT_SECONDS:-10}"
+SCREENSHOT_PATH="${STATE_DIR}/health-screenshot.webp"
+DESKTOP_BACKGROUND_COLOR="${ARCANIST_DESKTOP_BACKGROUND_COLOR:-#263240}"
+DBUS_ENV_PATH="${STATE_DIR}/dbus.env"
+SCREENSHOT_NONBLACK_MIN_RATIO="${ARCANIST_DESKTOP_SCREENSHOT_NONBLACK_MIN_RATIO:-0.001}"
+SCREENSHOT_ENTROPY_MIN="${ARCANIST_DESKTOP_SCREENSHOT_ENTROPY_MIN:-0.01}"
+
+mkdir -p "${PID_DIR}" "${LOG_DIR}" "${LOCK_DIR}"
+touch "${SUPERVISOR_LOG}" 2>/dev/null || true
+chmod 0600 "${SUPERVISOR_LOG}" 2>/dev/null || true
+
+timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date
+}
+
+now_seconds() {
+  date +%s 2>/dev/null || printf "0"
+}
+
+log_line() {
+  printf '[%s] %s\n' "$(timestamp)" "$*" >>"${SUPERVISOR_LOG}" 2>/dev/null || true
+}
+
+pid_file() {
+  printf '%s/%s.pid' "${PID_DIR}" "$1"
+}
+
+component_log_file() {
+  printf '%s/%s.log' "${LOG_DIR}" "$1"
+}
+
+pid_running() {
+  local pid
+  pid="$1"
+  case "${pid}" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  kill -0 "${pid}" 2>/dev/null
+}
+
+pid_matches_component() {
+  local component pid cmdline
+  component="$1"
+  pid="$2"
+  [ -r "/proc/${pid}/cmdline" ] || return 0
+  cmdline="$(tr '\000' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+  case "${component}" in
+    xvfb) case "${cmdline}" in *Xvfb*) return 0 ;; esac ;;
+    dbus) case "${cmdline}" in *dbus-daemon*) return 0 ;; esac ;;
+    xfsettingsd) case "${cmdline}" in *xfsettingsd*) return 0 ;; esac ;;
+    xfwm4) case "${cmdline}" in *xfwm4*) return 0 ;; esac ;;
+    xfdesktop) case "${cmdline}" in *xfdesktop*) return 0 ;; esac ;;
+    panel) case "${cmdline}" in *xfce4-panel*) return 0 ;; esac ;;
+    x11vnc) case "${cmdline}" in *x11vnc*) return 0 ;; esac ;;
+    websockify) case "${cmdline}" in *websockify*) return 0 ;; esac ;;
+    supervisor) case "${cmdline}" in *cycloid-desktop-supervisor* | *" supervise"*) return 0 ;; esac ;;
+    *) return 0 ;;
+  esac
+  return 1
+}
+
+pid_alive() {
+  local file pid
+  file="$(pid_file "$1")"
+  [ -r "${file}" ] || return 1
+  pid="$(cat "${file}" 2>/dev/null || true)"
+  pid_running "${pid}" || return 1
+  if pid_matches_component "$1" "${pid}"; then
+    return 0
+  fi
+  log_line "event=desktop.pid component=$1 status=stale action=remove pid=${pid}"
+  rm -f "${file}" 2>/dev/null || true
+  return 1
+}
+
+write_pid() {
+  if ! printf '%s\n' "$2" >"$(pid_file "$1")"; then
+    log_line "event=desktop.write_pid component=$1 outcome=failed"
+    return 1
+  fi
+}
+
+with_lock() {
+  local name path lock_dir owner rc deadline
+  name="$1"
+  shift
+  path="${LOCK_DIR}/${name}.lock"
+  lock_dir="${path}.d"
+  deadline=$(( $(now_seconds) + LOCK_WAIT_SECONDS ))
+  while ! mkdir "${lock_dir}" 2>/dev/null; do
+    if [ -r "${lock_dir}/pid" ]; then
+      owner="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
+      if ! pid_running "${owner}"; then
+        rm -rf "${lock_dir}" 2>/dev/null || true
+        continue
+      fi
+    fi
+    if [ "$(now_seconds)" -ge "${deadline}" ]; then
+      log_line "event=desktop.lock name=${name} outcome=timeout owner_pid=${owner:-unknown}"
+      return 1
+    fi
+    sleep 0.05 2>/dev/null || sleep 1
+  done
+  printf '%s\n' "$$" >"${lock_dir}/pid" 2>/dev/null || true
+  "$@"
+  rc=$?
+  rm -rf "${lock_dir}" 2>/dev/null || true
+  return "${rc}"
+}
+
+restart_history_file() {
+  printf '%s/restart-%s.ts' "${STATE_DIR}" "$1"
+}
+
+restart_count() {
+  local file cutoff now
+  file="$(restart_history_file "$1")"
+  [ -r "${file}" ] || {
+    printf "0"
+    return
+  }
+  now="$(now_seconds)"
+  cutoff=$((now - RESTART_WINDOW_SECONDS))
+  awk -v cutoff="${cutoff}" '$1 >= cutoff { count += 1 } END { print count + 0 }' "${file}" 2>/dev/null || printf "0"
+}
+
+record_restart_attempt() {
+  local component file cutoff now tmp
+  component="$1"
+  file="$(restart_history_file "${component}")"
+  now="$(now_seconds)"
+  cutoff=$((now - RESTART_WINDOW_SECONDS))
+  tmp="${file}.tmp"
+  if [ -r "${file}" ]; then
+    awk -v cutoff="${cutoff}" '$1 >= cutoff { print $1 }' "${file}" >"${tmp}" 2>/dev/null || : >"${tmp}"
+  else
+    : >"${tmp}"
+  fi
+  printf '%s\n' "${now}" >>"${tmp}"
+  mv "${tmp}" "${file}"
+}
+
+restart_backoff() {
+  case "$1" in
+    1) printf '%s' "${ARCANIST_DESKTOP_RESTART_BACKOFF_1_SECONDS:-1}" ;;
+    2) printf '%s' "${ARCANIST_DESKTOP_RESTART_BACKOFF_2_SECONDS:-5}" ;;
+    *) printf '%s' "${ARCANIST_DESKTOP_RESTART_BACKOFF_3_SECONDS:-15}" ;;
+  esac
+}
+
+component_marker() {
+  printf '%s/%s.started' "${STATE_DIR}" "$1"
+}
+
+load_dbus_env() {
+  if [ -r "${DBUS_ENV_PATH}" ]; then
+    # shellcheck disable=SC1090
+    . "${DBUS_ENV_PATH}" || true
+    export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}"
+  fi
+}
+
+display_number() {
+  local value number
+  value="${DISPLAY_VALUE#*:}"
+  number="${value%%.*}"
+  case "${number}" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  printf '%s' "${number}"
+}
+
+cleanup_xvfb_display_state() {
+  local number lock socket pid
+  number="$(display_number)" || return 0
+  lock="/tmp/.X${number}-lock"
+  socket="/tmp/.X11-unix/X${number}"
+  if [ -r "${lock}" ]; then
+    pid="$(tr -cd '0-9' <"${lock}" 2>/dev/null || true)"
+    if pid_running "${pid}"; then
+      log_line "event=desktop.x_display_lock status=active display=${DISPLAY_VALUE} pid=${pid}"
+      return 0
+    fi
+    log_line "event=desktop.x_display_lock status=stale action=remove display=${DISPLAY_VALUE}"
+    rm -f "${lock}" "${socket}" 2>/dev/null || true
+    return 0
+  fi
+  if [ -e "${socket}" ]; then
+    log_line "event=desktop.x_display_socket status=stale action=remove display=${DISPLAY_VALUE}"
+    rm -f "${socket}" 2>/dev/null || true
+  fi
+}
+
+start_component() {
+  local component pid log
+  component="$1"
+  log="$(component_log_file "${component}")"
+
+  case "${component}" in
+    xvfb)
+      cleanup_xvfb_display_state
+      Xvfb "${DISPLAY_VALUE}" -screen 0 "${DISPLAY_GEOMETRY}" -nolisten tcp </dev/null >>"${log}" 2>&1 &
+      ;;
+    dbus)
+      local dbus_output dbus_address dbus_pid
+      if dbus_output="$(dbus-daemon --session --fork --print-address=1 --print-pid=1 2>>"${log}")"; then
+        dbus_address="$(printf '%s\n' "${dbus_output}" | sed -n '1p')"
+        dbus_pid="$(printf '%s\n' "${dbus_output}" | sed -n '2p')"
+        case "${dbus_pid}" in
+          '' | *[!0-9]*)
+            log_line "event=desktop.start component=${component} outcome=invalid_pid"
+            return 1
+            ;;
+        esac
+        printf 'DBUS_SESSION_BUS_ADDRESS=%s\n' "${dbus_address}" >"${DBUS_ENV_PATH}"
+        write_pid "${component}" "${dbus_pid}"
+        touch "$(component_marker "${component}")"
+        log_line "event=desktop.start component=${component} outcome=started pid=${dbus_pid} display=${DISPLAY_VALUE}"
+        return 0
+      fi
+      log_line "event=desktop.start component=${component} outcome=failed"
+      return 1
+      ;;
+    xfsettingsd)
+      load_dbus_env
+      DISPLAY="${DISPLAY_VALUE}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" xfsettingsd --no-daemon </dev/null >>"${log}" 2>&1 &
+      ;;
+    xfwm4)
+      load_dbus_env
+      DISPLAY="${DISPLAY_VALUE}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" xfwm4 --replace </dev/null >>"${log}" 2>&1 &
+      ;;
+    xfdesktop)
+      load_dbus_env
+      DISPLAY="${DISPLAY_VALUE}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" xfdesktop --disable-wm-check </dev/null >>"${log}" 2>&1 &
+      ;;
+    panel)
+      load_dbus_env
+      DISPLAY="${DISPLAY_VALUE}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" xfce4-panel --disable-wm-check </dev/null >>"${log}" 2>&1 &
+      ;;
+    x11vnc)
+      DISPLAY="${DISPLAY_VALUE}" x11vnc -display "${DISPLAY_VALUE}" -localhost -forever -shared -nopw -viewonly -noclipboard -rfbport "${VNC_PORT}" </dev/null >>"${log}" 2>&1 &
+      ;;
+    websockify)
+      websockify --web="${NOVNC_WEB_ROOT}" "127.0.0.1:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" </dev/null >>"${log}" 2>&1 &
+      ;;
+    *)
+      log_line "event=desktop.start component=${component} outcome=invalid_component"
+      return 1
+      ;;
+  esac
+
+  pid="$!"
+  if ! write_pid "${component}" "${pid}"; then
+    kill "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    return 1
+  fi
+  if ! touch "$(component_marker "${component}")"; then
+    log_line "event=desktop.start component=${component} outcome=state_write_failed"
+    rm -f "$(pid_file "${component}")"
+    kill "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    return 1
+  fi
+  log_line "event=desktop.start component=${component} outcome=started pid=${pid} display=${DISPLAY_VALUE}"
+}
+
+stop_component() {
+  local component file pid attempt wait_status
+  component="$1"
+  file="$(pid_file "${component}")"
+  [ -r "${file}" ] || return 0
+  pid="$(cat "${file}" 2>/dev/null || true)"
+  case "${pid}" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  kill "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null
+  wait_status="$?"
+  if [ "${wait_status}" -ne 127 ]; then
+    return 0
+  fi
+  for attempt in {1..50}; do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+  kill -KILL "${pid}" 2>/dev/null || true
+  for attempt in {1..50}; do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.1 2>/dev/null || sleep 1
+  done
+}
+
+restart_component() {
+  local component reason count attempt backoff
+  component="$1"
+  reason="$2"
+  count="$(restart_count "${component}")"
+  if [ "${count}" -ge "${RESTART_BUDGET}" ]; then
+    log_line "event=desktop.restart component=${component} outcome=budget_exhausted reason=${reason} restart_count=${count}"
+    return 1
+  fi
+  attempt=$((count + 1))
+  record_restart_attempt "${component}"
+  backoff="$(restart_backoff "${attempt}")"
+  log_line "event=desktop.restart component=${component} attempt=${attempt} reason=${reason} backoff_s=${backoff}"
+  sleep "${backoff}" 2>/dev/null || true
+  stop_component "${component}"
+  start_component "${component}" && return 0
+  log_line "event=desktop.restart component=${component} attempt=${attempt} outcome=failed reason=${reason}"
+  return 1
+}
+
+ensure_component_unlocked() {
+  local component
+  component="$1"
+  if pid_alive "${component}"; then
+    if component_ready "${component}"; then
+      return 0
+    fi
+    if [ -e "$(component_marker "${component}")" ]; then
+      restart_component "${component}" "health_check_failed"
+      return $?
+    fi
+    return 0
+  fi
+  if [ -e "$(component_marker "${component}")" ]; then
+    restart_component "${component}" "process_exit"
+    return $?
+  fi
+  start_component "${component}"
+}
+
+ensure_component() {
+  local component
+  component="$1"
+  with_lock "component-${component}" ensure_component_unlocked "${component}"
+}
+
+port_reachable() {
+  nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+}
+
+vnc_protocol_ready() {
+  local banner
+  banner="$(nc -w 1 127.0.0.1 "${VNC_PORT}" 2>/dev/null | head -c 12 || true)"
+  case "${banner}" in
+    "RFB 003.003"* | "RFB 003.007"* | "RFB 003.008"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+websockify_protocol_ready() {
+  local response
+  response="$(
+    printf 'GET /websockify HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' "${NOVNC_PORT}" \
+      | nc -w 1 127.0.0.1 "${NOVNC_PORT}" 2>/dev/null \
+      | head -n 1 \
+      | tr -d '\r' || true
+  )"
+  case "${response}" in
+    HTTP/*" 101 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+component_ready() {
+  local component
+  component="$1"
+  pid_alive "${component}" || return 1
+  case "${component}" in
+    xvfb)
+      local size width height
+      size="$(display_size || true)"
+      width="$(printf '%s' "${size}" | awk '{ print $1 }')"
+      height="$(printf '%s' "${size}" | awk '{ print $2 }')"
+      case "${width}:${height}" in
+        *[!0-9:]* | ":" | "0:0" | "0:" | ":0") return 1 ;;
+      esac
+      ;;
+    x11vnc)
+      vnc_protocol_ready || return 1
+      ;;
+    websockify)
+      websockify_protocol_ready || return 1
+      ;;
+  esac
+  return 0
+}
+
+loopback_bound() {
+  local port output line address found
+  port="$1"
+  output="$(ss -ltn 2>/dev/null)"
+  if [ "$?" -ne 0 ]; then
+    LOOPBACK_BIND_ERROR="ss_unavailable"
+    return 2
+  fi
+  found=0
+  while IFS= read -r line; do
+    case "${line}" in
+      *":${port} "* | *".${port} "*)
+        found=1
+        address="$(printf '%s\n' "${line}" | awk '{ print $4 }')"
+        case "${address}" in
+          127.0.0.1:${port} | 127.0.0.1.${port} | "[::1]:${port}" | "[::1].${port}") ;;
+          # E2B exposes forwarded ports on a sandbox-local link address while the
+          # underlying desktop services stay bound to loopback.
+          169.254.*:${port} | 169.254.*.${port}) ;;
+          *)
+            LOOPBACK_BIND_ERROR="non_loopback_binding"
+            return 1
+            ;;
+        esac
+        ;;
+    esac
+  done <<EOF
+${output}
+EOF
+  [ "${found}" -eq 1 ]
+}
+
+display_size() {
+  DISPLAY="${DISPLAY_VALUE}" xdotool getdisplaygeometry 2>/dev/null | awk '{ print $1 " " $2 }'
+}
+
+configure_desktop_background() {
+  load_dbus_env
+  if command -v xfconf-query >/dev/null 2>&1; then
+    DISPLAY="${DISPLAY_VALUE}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" xfconf-query -c xfce4-desktop -p /backdrop/screen0/monitor0/workspace0/color-style -n -t int -s 0 >/dev/null 2>&1 || true
+  fi
+  DISPLAY="${DISPLAY_VALUE}" xsetroot -solid "${DESKTOP_BACKGROUND_COLOR}" >/dev/null 2>&1
+}
+
+active_window_json() {
+  DISPLAY="${DISPLAY_VALUE}" PYTHONPATH= python -I - <<'PY'
+import json
+import os
+import subprocess
+
+display = os.environ.get("DISPLAY", ":99")
+env = os.environ.copy()
+env["DISPLAY"] = display
+
+try:
+    active = subprocess.run(["xdotool", "getactivewindow"], env=env, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+except (OSError, subprocess.TimeoutExpired):
+    print("null")
+    raise SystemExit(0)
+window_id = active.stdout.strip()
+if not window_id:
+    print("null")
+    raise SystemExit(0)
+
+try:
+    listing = subprocess.run(["wmctrl", "-lG"], env=env, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+except (OSError, subprocess.TimeoutExpired):
+    print(json.dumps({"id": window_id, "title": None, "bounds": None}))
+    raise SystemExit(0)
+
+for line in listing.stdout.splitlines():
+    parts = line.split(None, 7)
+    if len(parts) < 8 or parts[0] != window_id:
+        continue
+    title = parts[7]
+    try:
+        bounds = {"x": int(parts[2]), "y": int(parts[3]), "width": int(parts[4]), "height": int(parts[5])}
+    except ValueError:
+        bounds = None
+    print(json.dumps({"id": window_id, "title": title or None, "bounds": bounds}, separators=(",", ":")))
+    raise SystemExit(0)
+
+print(json.dumps({"id": window_id, "title": None, "bounds": None}, separators=(",", ":")))
+PY
+}
+
+screenshot_quality_metrics() {
+  local image_path width height
+  image_path="$1"
+  width="$2"
+  height="$3"
+  ARCANIST_DESKTOP_SCREENSHOT_PATH="${image_path}" \
+  ARCANIST_DESKTOP_WIDTH="${width}" \
+  ARCANIST_DESKTOP_HEIGHT="${height}" \
+  PYTHONPATH= \
+    python -I - <<'PY'
+import collections
+import math
+import os
+import shutil
+import subprocess
+import sys
+
+path = os.environ["ARCANIST_DESKTOP_SCREENSHOT_PATH"]
+width = int(os.environ.get("ARCANIST_DESKTOP_WIDTH") or 0)
+height = int(os.environ.get("ARCANIST_DESKTOP_HEIGHT") or 0)
+
+def entropy(values: bytes) -> float:
+    if not values:
+        return 0.0
+    counts = collections.Counter(values)
+    total = len(values)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+raw = b""
+if width > 0 and height > 0 and shutil.which("ffmpeg"):
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            raw = result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        raw = b""
+
+try:
+    fallback = open(path, "rb").read()
+except OSError:
+    print("0 0 0 1")
+    raise SystemExit(0)
+
+if raw:
+    pixel_count = len(raw) // 3
+    non_black = 0
+    for index in range(0, pixel_count * 3, 3):
+        if raw[index] > 8 or raw[index + 1] > 8 or raw[index + 2] > 8:
+            non_black += 1
+    ratio = non_black / pixel_count if pixel_count else 0.0
+    sample = raw[: min(len(raw), 256 * 1024)]
+else:
+    sample = fallback[: min(len(fallback), 256 * 1024)]
+    ratio = sum(1 for byte in sample if byte != 0) / len(sample) if sample else 0.0
+
+ent = entropy(sample)
+uniform = 1 if len(set(sample[: min(len(sample), 8192)])) <= 1 else 0
+print(f"1 {ratio:.6f} {ent:.6f} {uniform}")
+PY
+}
+
+capture_health_screenshot() {
+  local width height
+  width="$1"
+  height="$2"
+  rm -f "${SCREENSHOT_PATH}" 2>/dev/null || true
+  if DISPLAY="${DISPLAY_VALUE}" scrot "${SCREENSHOT_PATH}" >/dev/null 2>&1 && [ -s "${SCREENSHOT_PATH}" ]; then
+    return 0
+  fi
+  rm -f "${SCREENSHOT_PATH}" 2>/dev/null || true
+  command -v ffmpeg >/dev/null 2>&1 || return 1
+  ffmpeg -hide_banner -loglevel error \
+    -f x11grab -video_size "${width}x${height}" -i "${DISPLAY_VALUE}+0,0" \
+    -frames:v 1 -an -c:v libwebp -lossless 1 -f webp -y "${SCREENSHOT_PATH}" >/dev/null 2>&1
+  [ -s "${SCREENSHOT_PATH}" ]
+}
+
+phase_for_component() {
+  case "$1" in
+    xvfb) printf '%s' "x_display" ;;
+    dbus) printf '%s' "dbus_start" ;;
+    xfsettingsd) printf '%s' "desktop_root" ;;
+    xfwm4) printf '%s' "window_manager" ;;
+    xfdesktop) printf '%s' "desktop_root" ;;
+    panel) printf '%s' "panel" ;;
+    screenshot) printf '%s' "screenshot_capture" ;;
+    screenshot_black_or_uniform) printf '%s' "screenshot_black_or_uniform" ;;
+    x11vnc) printf '%s' "vnc_ready" ;;
+    websockify) printf '%s' "websockify_ready" ;;
+    ports) printf '%s' "provider_port_resolve" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+write_health_json() {
+  local status failed_component failed_phase last_error width height screenshot_ok screenshot_nonblack_ratio screenshot_entropy screenshot_uniform background_ok panel_ok vnc_ok novnc_ok loopback_ok active_window health_check_mode screenshot_checked_at
+  status="$1"
+  failed_component="$2"
+  failed_phase="$3"
+  last_error="$4"
+  width="$5"
+  height="$6"
+  screenshot_ok="$7"
+  screenshot_nonblack_ratio="$8"
+  screenshot_entropy="$9"
+  screenshot_uniform="${10}"
+  background_ok="${11}"
+  panel_ok="${12}"
+  vnc_ok="${13}"
+  novnc_ok="${14}"
+  loopback_ok="${15}"
+  active_window="${16}"
+  health_check_mode="${17}"
+  screenshot_checked_at="${18}"
+
+  ARCANIST_DESKTOP_HEALTH_OUT="${HEALTH_PATH}.tmp" \
+  ARCANIST_DESKTOP_STATUS="${status}" \
+  ARCANIST_DESKTOP_FAILED_COMPONENT="${failed_component}" \
+  ARCANIST_DESKTOP_FAILED_PHASE="${failed_phase}" \
+  ARCANIST_DESKTOP_LAST_ERROR="${last_error}" \
+  ARCANIST_DESKTOP_DISPLAY="${DISPLAY_VALUE}" \
+  ARCANIST_DESKTOP_WIDTH="${width}" \
+  ARCANIST_DESKTOP_HEIGHT="${height}" \
+  ARCANIST_DESKTOP_SCREENSHOT_OK="${screenshot_ok}" \
+  ARCANIST_DESKTOP_SCREENSHOT_NONBLACK_RATIO="${screenshot_nonblack_ratio}" \
+  ARCANIST_DESKTOP_SCREENSHOT_ENTROPY="${screenshot_entropy}" \
+  ARCANIST_DESKTOP_SCREENSHOT_UNIFORM="${screenshot_uniform}" \
+  ARCANIST_DESKTOP_BACKGROUND_OK="${background_ok}" \
+  ARCANIST_DESKTOP_PANEL_OK="${panel_ok}" \
+  ARCANIST_DESKTOP_VNC_OK="${vnc_ok}" \
+  ARCANIST_DESKTOP_NOVNC_OK="${novnc_ok}" \
+  ARCANIST_DESKTOP_LOOPBACK_OK="${loopback_ok}" \
+  ARCANIST_DESKTOP_VNC_PORT="${VNC_PORT}" \
+  ARCANIST_DESKTOP_NOVNC_PORT="${NOVNC_PORT}" \
+  ARCANIST_DESKTOP_STATE_DIR="${STATE_DIR}" \
+  ARCANIST_DESKTOP_ACTIVE_WINDOW_JSON="${active_window}" \
+  ARCANIST_DESKTOP_HEALTH_CHECK_MODE="${health_check_mode}" \
+  ARCANIST_DESKTOP_SCREENSHOT_CHECKED_AT="${screenshot_checked_at}" \
+  ARCANIST_DESKTOP_SUPERVISOR_GENERATION="$(cat "${SUPERVISOR_GENERATION_PATH}" 2>/dev/null || true)" \
+  PYTHONPATH= \
+    python -I - <<'PY'
+import glob
+import json
+import os
+import time
+
+state_dir = os.environ["ARCANIST_DESKTOP_STATE_DIR"]
+restart_counts = {}
+now = int(time.time())
+window = int(os.environ.get("ARCANIST_DESKTOP_RESTART_WINDOW_SECONDS", "300"))
+for path in glob.glob(os.path.join(state_dir, "restart-*.ts")):
+    component = os.path.basename(path)[len("restart-") : -len(".ts")]
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            restart_counts[component] = sum(1 for line in handle if line.strip().isdigit() and int(line) >= now - window)
+    except OSError:
+        restart_counts[component] = 0
+
+def as_bool(name: str) -> bool:
+    return os.environ.get(name) == "1"
+
+payload = {
+    "ok": os.environ["ARCANIST_DESKTOP_STATUS"] == "available",
+    "status": os.environ["ARCANIST_DESKTOP_STATUS"],
+    "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "healthCheckMode": os.environ["ARCANIST_DESKTOP_HEALTH_CHECK_MODE"],
+    "supervisorGeneration": os.environ.get("ARCANIST_DESKTOP_SUPERVISOR_GENERATION") or None,
+    "display": os.environ["ARCANIST_DESKTOP_DISPLAY"],
+    "size": {
+        "width": int(os.environ.get("ARCANIST_DESKTOP_WIDTH") or 0),
+        "height": int(os.environ.get("ARCANIST_DESKTOP_HEIGHT") or 0),
+    },
+    "ports": {
+        "vnc": {"host": "127.0.0.1", "port": int(os.environ["ARCANIST_DESKTOP_VNC_PORT"]), "reachable": as_bool("ARCANIST_DESKTOP_VNC_OK")},
+        "novnc": {"host": "127.0.0.1", "port": int(os.environ["ARCANIST_DESKTOP_NOVNC_PORT"]), "reachable": as_bool("ARCANIST_DESKTOP_NOVNC_OK")},
+        "loopbackOnly": as_bool("ARCANIST_DESKTOP_LOOPBACK_OK"),
+    },
+    "checks": {
+        "screenshot": as_bool("ARCANIST_DESKTOP_SCREENSHOT_OK"),
+        "background": as_bool("ARCANIST_DESKTOP_BACKGROUND_OK"),
+        "panel": as_bool("ARCANIST_DESKTOP_PANEL_OK"),
+        "desktopRoot": os.environ["ARCANIST_DESKTOP_FAILED_COMPONENT"] != "xfdesktop",
+    },
+    "screenshot": {
+        "path": os.path.join(state_dir, "health-screenshot.webp"),
+        "nonBlackPixelRatio": float(os.environ.get("ARCANIST_DESKTOP_SCREENSHOT_NONBLACK_RATIO") or 0),
+        "entropy": float(os.environ.get("ARCANIST_DESKTOP_SCREENSHOT_ENTROPY") or 0),
+        "uniform": as_bool("ARCANIST_DESKTOP_SCREENSHOT_UNIFORM"),
+        "checkedAt": os.environ.get("ARCANIST_DESKTOP_SCREENSHOT_CHECKED_AT") or None,
+    },
+    "components": {
+        "xDisplay": {"name": "xvfb", "running": os.environ["ARCANIST_DESKTOP_FAILED_COMPONENT"] != "xvfb"},
+        "dbus": {"name": "dbus", "running": os.environ["ARCANIST_DESKTOP_FAILED_COMPONENT"] != "dbus"},
+        "settingsDaemon": {"name": "xfsettingsd", "running": os.environ["ARCANIST_DESKTOP_FAILED_COMPONENT"] != "xfsettingsd"},
+        "windowManager": {"name": "xfwm4", "running": os.environ["ARCANIST_DESKTOP_FAILED_COMPONENT"] != "xfwm4"},
+        "desktopRoot": {"name": "xfdesktop", "running": os.environ["ARCANIST_DESKTOP_FAILED_COMPONENT"] != "xfdesktop"},
+        "panel": {"name": "xfce4-panel", "running": as_bool("ARCANIST_DESKTOP_PANEL_OK")},
+        "vnc": {"name": "x11vnc", "running": as_bool("ARCANIST_DESKTOP_VNC_OK")},
+        "websockify": {"name": "websockify", "running": as_bool("ARCANIST_DESKTOP_NOVNC_OK")},
+    },
+    "activeWindow": json.loads(os.environ.get("ARCANIST_DESKTOP_ACTIVE_WINDOW_JSON") or "null"),
+    "restartCounts": restart_counts,
+    "failedComponent": os.environ.get("ARCANIST_DESKTOP_FAILED_COMPONENT") or None,
+    "failedPhase": os.environ.get("ARCANIST_DESKTOP_FAILED_PHASE") or None,
+    "lastError": os.environ.get("ARCANIST_DESKTOP_LAST_ERROR") or None,
+    "lastSafeErrorCode": os.environ.get("ARCANIST_DESKTOP_LAST_ERROR") or None,
+}
+
+with open(os.environ["ARCANIST_DESKTOP_HEALTH_OUT"], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  mv "${HEALTH_PATH}.tmp" "${HEALTH_PATH}" 2>/dev/null || true
+}
+
+previous_screenshot_health() {
+  [ -r "${HEALTH_PATH}" ] || return 1
+  ARCANIST_DESKTOP_HEALTH_PATH="${HEALTH_PATH}" PYTHONPATH= python -I - <<'PY'
+import json
+import os
+
+try:
+    with open(os.environ["ARCANIST_DESKTOP_HEALTH_PATH"], "r", encoding="utf-8") as handle:
+        health = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+checks = health.get("checks") if isinstance(health.get("checks"), dict) else {}
+screenshot = health.get("screenshot") if isinstance(health.get("screenshot"), dict) else {}
+checked_at = screenshot.get("checkedAt")
+if not isinstance(checked_at, str) or not checked_at:
+    raise SystemExit(1)
+print(
+    "{} {} {} {} {}".format(
+        1 if checks.get("screenshot") is True else 0,
+        float(screenshot.get("nonBlackPixelRatio") or 0),
+        float(screenshot.get("entropy") or 0),
+        1 if screenshot.get("uniform") is True else 0,
+        checked_at,
+    )
+)
+PY
+}
+
+evaluate_health() {
+  local health_check_mode size width height screenshot_ok screenshot_metric_ok screenshot_nonblack_ratio screenshot_entropy screenshot_uniform screenshot_checked_at screenshot_checked_now background_ok panel_ok vnc_ok novnc_ok loopback_ok status failed phase error metrics active_window
+  health_check_mode="${1:-full}"
+  width=0
+  height=0
+  screenshot_ok=0
+  screenshot_nonblack_ratio=0
+  screenshot_entropy=0
+  screenshot_uniform=1
+  screenshot_checked_at=""
+  screenshot_checked_now=0
+  background_ok=0
+  panel_ok=0
+  vnc_ok=0
+  novnc_ok=0
+  loopback_ok=0
+  status="available"
+  failed=""
+  phase=""
+  error=""
+
+  if [ "${health_check_mode}" = "lightweight" ]; then
+    metrics="$(previous_screenshot_health 2>/dev/null || true)"
+    if [ -n "${metrics}" ]; then
+      screenshot_ok="$(printf '%s' "${metrics}" | awk '{ print $1 }')"
+      screenshot_nonblack_ratio="$(printf '%s' "${metrics}" | awk '{ print $2 }')"
+      screenshot_entropy="$(printf '%s' "${metrics}" | awk '{ print $3 }')"
+      screenshot_uniform="$(printf '%s' "${metrics}" | awk '{ print $4 }')"
+      screenshot_checked_at="$(printf '%s' "${metrics}" | awk '{ print $5 }')"
+    fi
+  fi
+
+  if ! pid_alive xvfb; then
+    status="unavailable"
+    failed="xvfb"
+    phase="$(phase_for_component "${failed}")"
+    error="x_display_process_not_running"
+  else
+    size="$(display_size || true)"
+    width="$(printf '%s' "${size}" | awk '{ print $1 }')"
+    height="$(printf '%s' "${size}" | awk '{ print $2 }')"
+    case "${width}:${height}" in
+      *[!0-9:]* | ":" | "0:0" | "0:" | ":0")
+        status="unavailable"
+        failed="xvfb"
+        phase="$(phase_for_component "${failed}")"
+        error="x_display_unreachable"
+        width=0
+        height=0
+        ;;
+    esac
+  fi
+
+  if [ "${status}" = "available" ] && ! pid_alive dbus; then
+    status="unavailable"
+    failed="dbus"
+    phase="$(phase_for_component "${failed}")"
+    error="dbus_session_not_running"
+  fi
+
+  if [ "${status}" = "available" ] && ! pid_alive xfsettingsd; then
+    status="unavailable"
+    failed="xfsettingsd"
+    phase="$(phase_for_component "${failed}")"
+    error="desktop_settings_not_running"
+  fi
+
+  if [ "${status}" = "available" ] && ! pid_alive xfwm4; then
+    status="unavailable"
+    failed="xfwm4"
+    phase="$(phase_for_component "${failed}")"
+    error="window_manager_not_running"
+  fi
+
+  if [ "${status}" = "available" ] && ! pid_alive xfdesktop; then
+    status="unavailable"
+    failed="xfdesktop"
+    phase="$(phase_for_component "${failed}")"
+    error="desktop_root_not_running"
+  fi
+
+  if [ "${status}" = "available" ] && ! configure_desktop_background; then
+    status="unavailable"
+    failed="background"
+    phase="desktop_root"
+    error="desktop_background_failed"
+  elif [ "${status}" = "available" ]; then
+    background_ok=1
+  fi
+
+  if [ "${status}" = "available" ] && ! pid_alive panel; then
+    status="unavailable"
+    failed="panel"
+    phase="$(phase_for_component "${failed}")"
+    error="desktop_panel_not_running"
+  elif [ "${status}" = "available" ]; then
+    panel_ok=1
+  fi
+
+  if [ "${status}" = "available" ] && [ "${health_check_mode}" = "full" ]; then
+    screenshot_checked_now=1
+    screenshot_checked_at="$(timestamp)"
+    if ! capture_health_screenshot "${width:-0}" "${height:-0}"; then
+      status="unavailable"
+      failed="screenshot"
+      phase="$(phase_for_component "${failed}")"
+      error="screenshot_capture_failed"
+    elif [ -s "${SCREENSHOT_PATH}" ]; then
+      screenshot_ok=1
+      metrics="$(screenshot_quality_metrics "${SCREENSHOT_PATH}" "${width:-0}" "${height:-0}" || printf '0 0 0 1')"
+      screenshot_metric_ok="$(printf '%s' "${metrics}" | awk '{ print $1 }')"
+      screenshot_nonblack_ratio="$(printf '%s' "${metrics}" | awk '{ print $2 }')"
+      screenshot_entropy="$(printf '%s' "${metrics}" | awk '{ print $3 }')"
+      screenshot_uniform="$(printf '%s' "${metrics}" | awk '{ print $4 }')"
+      if [ "${screenshot_metric_ok}" != "1" ]; then
+        status="unavailable"
+        failed="screenshot"
+        phase="$(phase_for_component "${failed}")"
+        error="screenshot_quality_check_failed"
+      elif ! awk -v ratio="${screenshot_nonblack_ratio}" -v min="${SCREENSHOT_NONBLACK_MIN_RATIO}" 'BEGIN { exit !(ratio >= min) }'; then
+        status="unavailable"
+        failed="screenshot_black_or_uniform"
+        phase="$(phase_for_component "${failed}")"
+        error="screenshot_black_or_uniform"
+      elif ! awk -v entropy="${screenshot_entropy}" -v min="${SCREENSHOT_ENTROPY_MIN}" 'BEGIN { exit !(entropy >= min) }'; then
+        status="unavailable"
+        failed="screenshot_black_or_uniform"
+        phase="$(phase_for_component "${failed}")"
+        error="screenshot_black_or_uniform"
+      elif [ "${screenshot_uniform}" = "1" ]; then
+        status="unavailable"
+        failed="screenshot_black_or_uniform"
+        phase="$(phase_for_component "${failed}")"
+        error="screenshot_black_or_uniform"
+      fi
+    fi
+  fi
+
+  if [ "${status}" = "available" ] && [ "${health_check_mode}" = "lightweight" ] && [ "${screenshot_ok}" != "1" ]; then
+    status="unavailable"
+    failed="screenshot"
+    phase="$(phase_for_component "${failed}")"
+    error="screenshot_check_missing"
+  fi
+
+  if [ "${status}" = "available" ]; then
+    if ! port_reachable "${VNC_PORT}"; then status="unavailable"; failed="x11vnc"; phase="$(phase_for_component "${failed}")"; error="vnc_port_unreachable";
+    elif vnc_protocol_ready; then vnc_ok=1; else status="unavailable"; failed="x11vnc"; phase="$(phase_for_component "${failed}")"; error="vnc_rfb_handshake_failed"; fi
+  fi
+  if [ "${status}" = "available" ]; then
+    if ! port_reachable "${NOVNC_PORT}"; then status="unavailable"; failed="websockify"; phase="$(phase_for_component "${failed}")"; error="novnc_port_unreachable";
+    elif websockify_protocol_ready; then novnc_ok=1; else status="unavailable"; failed="websockify"; phase="$(phase_for_component "${failed}")"; error="novnc_websocket_handshake_failed"; fi
+  fi
+  if [ "${status}" = "available" ]; then
+    LOOPBACK_BIND_ERROR=""
+    if loopback_bound "${VNC_PORT}" && loopback_bound "${NOVNC_PORT}"; then loopback_ok=1; else status="unavailable"; failed="ports"; phase="$(phase_for_component "${failed}")"; error="${LOOPBACK_BIND_ERROR:-non_loopback_binding}"; fi
+  fi
+
+  active_window="$(active_window_json || printf 'null')"
+  write_health_json "${status}" "${failed}" "${phase}" "${error}" "${width:-0}" "${height:-0}" "${screenshot_ok}" "${screenshot_nonblack_ratio}" "${screenshot_entropy}" "${screenshot_uniform}" "${background_ok}" "${panel_ok}" "${vnc_ok}" "${novnc_ok}" "${loopback_ok}" "${active_window}" "${health_check_mode}" "${screenshot_checked_at}"
+  log_line "event=desktop.health status=${status} check_mode=${health_check_mode} failed_component=${failed:-none} phase=${phase:-none} error_code=${error:-none} screenshot_checked=${screenshot_checked_now} screenshot_checked_at=${screenshot_checked_at:-none} screenshot_nonblack_ratio=${screenshot_nonblack_ratio} screenshot_entropy=${screenshot_entropy} restart_xfwm4=$(restart_count xfwm4) restart_xfdesktop=$(restart_count xfdesktop) restart_panel=$(restart_count panel) restart_x11vnc=$(restart_count x11vnc) restart_websockify=$(restart_count websockify)"
+}
+
+supervise_loop() {
+  local health_check_mode iteration
+  iteration=0
+  log_line "event=desktop.start supervisor=running display=${DISPLAY_VALUE} geometry=${DISPLAY_GEOMETRY} vnc_port=${VNC_PORT} novnc_port=${NOVNC_PORT}"
+  while true; do
+    ensure_component xvfb || true
+    ensure_component dbus || true
+    ensure_component xfsettingsd || true
+    ensure_component xfwm4 || true
+    ensure_component xfdesktop || true
+    ensure_component panel || true
+    ensure_component x11vnc || true
+    ensure_component websockify || true
+    health_check_mode="full"
+    if [ "${iteration}" -gt 0 ] && health_is_available; then
+      health_check_mode="lightweight"
+    fi
+    with_lock "health-evaluation" evaluate_health "${health_check_mode}" || true
+
+    iteration=$((iteration + 1))
+    if [ "${SUPERVISOR_ITERATIONS}" -gt 0 ] && [ "${iteration}" -ge "${SUPERVISOR_ITERATIONS}" ]; then
+      stop_component websockify
+      stop_component x11vnc
+      stop_component panel
+      stop_component xfdesktop
+      stop_component xfwm4
+      stop_component xfsettingsd
+      stop_component dbus
+      stop_component xvfb
+      return 0
+    fi
+    sleep "${HEALTH_INTERVAL_SECONDS}" 2>/dev/null || sleep 5
+  done
+}
+
+start_supervisor_unlocked() {
+  if pid_alive supervisor; then
+    log_line "event=desktop.start supervisor=already_running"
+    return 0
+  fi
+  if command -v cycloid-desktop >/dev/null 2>&1; then
+    if cycloid-desktop record_status --json --resume-check >/dev/null 2>>"${SUPERVISOR_LOG}"; then
+      log_line "event=desktop.recording_resume_check outcome=ok"
+    else
+      log_line "event=desktop.recording_resume_check outcome=failed"
+    fi
+  fi
+  # A generation identifies one concrete supervisor process lifetime. Keep it
+  # in shared state so CLI results and health samples can be correlated across
+  # component restarts without using a raw process id.
+  printf '%s-%s-%s\n' "$(now_seconds)" "${RANDOM:-0}" "${RANDOM:-0}" >"${SUPERVISOR_GENERATION_PATH}" 2>/dev/null || true
+  (
+    exec "$0" supervise
+  ) >>"${SUPERVISOR_LOG}" 2>&1 &
+  write_pid supervisor "$!"
+  log_line "event=desktop.start supervisor=launched pid=$! display=${DISPLAY_VALUE}"
+}
+
+start_supervisor() {
+  with_lock "supervisor-start" start_supervisor_unlocked
+}
+
+health_is_available() {
+  [ -r "${HEALTH_PATH}" ] || return 1
+  ARCANIST_DESKTOP_HEALTH_PATH="${HEALTH_PATH}" PYTHONPATH= python -I - <<'PY' >/dev/null 2>&1
+import json
+import os
+
+try:
+    with open(os.environ["ARCANIST_DESKTOP_HEALTH_PATH"], "r", encoding="utf-8") as handle:
+        health = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+raise SystemExit(0 if health.get("ok") is True and health.get("status") == "available" else 1)
+PY
+}
+
+print_health_json() {
+  if [ ! -r "${HEALTH_PATH}" ]; then
+    write_health_json "preparing" "" "" "" 0 0 0 0 0 1 0 0 0 0 0 "null" "none" ""
+  fi
+  cat "${HEALTH_PATH}"
+}
+
+refresh_health_if_running() {
+  if pid_alive supervisor; then
+    with_lock "health-evaluation" evaluate_health full || true
+  fi
+  print_health_json
+}
+
+wait_for_ready_health() {
+  local deadline
+  deadline=$(( $(now_seconds) + START_READY_TIMEOUT_SECONDS ))
+  while true; do
+    if health_is_available; then
+      return 0
+    fi
+    if [ "$(now_seconds)" -ge "${deadline}" ]; then
+      return 1
+    fi
+    sleep "${START_READY_POLL_SECONDS}" 2>/dev/null || sleep 1
+  done
+}
+
+stop_all() {
+  if command -v cycloid-desktop >/dev/null 2>&1; then
+    if cycloid-desktop record_stop --json --reason interrupted >/dev/null 2>>"${SUPERVISOR_LOG}"; then
+      log_line "event=desktop.recording_pause_flush outcome=ok"
+    else
+      log_line "event=desktop.recording_pause_flush outcome=skipped_or_failed"
+    fi
+  fi
+  stop_component websockify
+  stop_component x11vnc
+  stop_component panel
+  stop_component xfdesktop
+  stop_component xfwm4
+  stop_component xfsettingsd
+  stop_component dbus
+  stop_component xvfb
+  stop_component supervisor
+}
+
+case "${1:-start}" in
+  start)
+    start_supervisor
+    ;;
+  start-ready)
+    start_supervisor || exit $?
+    if ! wait_for_ready_health; then
+      print_health_json
+      exit 1
+    fi
+    print_health_json
+    ;;
+  supervise)
+    supervise_loop
+    ;;
+  health)
+    refresh_health_if_running
+    ;;
+  stop)
+    stop_all
+    ;;
+  *)
+    printf 'usage: cycloid-desktop-supervisor [start|start-ready|supervise|health|stop]\n' >&2
+    exit 2
+    ;;
+esac

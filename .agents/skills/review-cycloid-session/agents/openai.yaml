@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Cycloid Session"
+  short_description: "Wait for and audit one Cycloid session"
+  default_prompt: "Use $review-cycloid-session to review this Cycloid session from its URL or UUID, wait for it if it is still active, reconstruct the tool calls and process, and assess what was good, bad, or customer-facingly confusing."

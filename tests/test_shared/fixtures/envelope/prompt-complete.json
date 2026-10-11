@@ -1,0 +1,14 @@
+{
+  "phase": "prompt.complete",
+  "timestampMs": 1760000000800,
+  "sessionId": "sess-envelope",
+  "promptId": "prompt-envelope",
+  "sandboxId": "sbx-envelope",
+  "payload": {
+    "success": true,
+    "bridgeEventType": "execution_complete",
+    "bridgeData": {
+      "durationMs": 1200
+    }
+  }
+}

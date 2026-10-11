@@ -1,0 +1,9 @@
+{
+  "raw_button": 100,
+  "raw_input": 33,
+  "raw_select": 8,
+  "raw_textarea": 8,
+  "bracket_magic_numbers": 177,
+  "requestJson_inline_literal": 42,
+  "requestJson_unvalidated": 72
+}

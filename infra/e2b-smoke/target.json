@@ -1,0 +1,11 @@
+{
+  "name": "cycloid-smoke",
+  "awsAccountId": "666177270058",
+  "awsRegion": "us-east-1",
+  "domainName": "cycloid-e2b-dev.com",
+  "prefix": "arc-e2b-smoke-",
+  "backendConfig": "backend.hcl",
+  "varFile": "cycloid-lean.tfvars",
+  "planFile": "/tmp/e2b-smoke-lean.tfplan",
+  "destroyPlanFile": "/tmp/e2b-smoke-lean-destroy.tfplan"
+}

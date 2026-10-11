@@ -1,0 +1,12 @@
+{
+  "name": "@cycloid/sandbox-e2b",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build-template": "tsx template.ts",
+    "ready-check": "bash ready-check.sh"
+  },
+  "dependencies": {
+    "e2b": "^2.32.0"
+  }
+}

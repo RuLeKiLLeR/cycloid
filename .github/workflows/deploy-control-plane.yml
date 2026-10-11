@@ -1,0 +1,78 @@
+name: Deploy Control Plane Worker
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - apps/control-plane-worker/**
+      - shared/**
+      - package.json
+      - package-lock.json
+      - scripts/cloudflare-benchmark-gate.mjs
+      - .github/workflows/deploy-control-plane.yml
+      - .github/workflows/deploy-control-plane-core.yml
+      - infra/ssm.tf
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy to production control plane
+        required: true
+        default: main
+      force_deploy:
+        description: Bypass bundle-hash skip and deploy the worker
+        required: false
+        type: boolean
+        default: true
+      sync_secrets:
+        description: Sync SSM secrets before deploying
+        required: false
+        type: boolean
+        default: true
+      wait_for_tfc:
+        description: Wait for Terraform Cloud before syncing secrets
+        required: false
+        type: boolean
+        default: false
+      notify_slack:
+        description: Send a Slack notification for this deploy
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+  id-token: write
+  statuses: read
+jobs:
+  validate:
+    name: Validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Install worker dependencies
+        run: npm ci
+      - name: Benchmark gate
+        run: node scripts/cloudflare-benchmark-gate.mjs
+  deploy:
+    name: Deploy
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/deploy-control-plane-core.yml
+    permissions:
+      contents: read
+      id-token: write
+      statuses: read
+    with:
+      ref: ${{ inputs.ref }}
+      environment: production
+      force_deploy: ${{ inputs.force_deploy }}
+      sync_secrets: ${{ inputs.sync_secrets }}
+      wait_for_tfc: ${{ inputs.wait_for_tfc }}
+      notify_slack: ${{ inputs.notify_slack }}
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

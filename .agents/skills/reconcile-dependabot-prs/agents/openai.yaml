@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reconcile Dependabot PRs"
+  short_description: "Sweep, merge, or close Dependabot dependency-bump PRs"
+  default_prompt: "Use $reconcile-dependabot-prs to process all open Dependabot PRs in this repo by merging the safe green-CI patch and minor bumps, closing the ones superseded or already on main, and leaving major-version or red-CI bumps open with rationale."

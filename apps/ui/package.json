@@ -1,0 +1,39 @@
+{
+  "name": "cycloid-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && esbuild src/worker.ts --bundle --outfile=../../dist/ui/_worker.js --format=esm",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@datadog/browser-rum": "^6.31.0",
+    "@datadog/browser-rum-react": "^6.31.0",
+    "@fontsource-variable/inter-tight": "^5.2.7",
+    "@novnc/novnc": "1.5.0",
+    "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@sentry/react": "^10.42.0",
+    "@tailwindcss/vite": "^4.2.1",
+    "react": "^18.3.1",
+    "react-diff-viewer-continued": "^4.3.0",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "react-router": "^7.13.1",
+    "remark-gfm": "^4.0.1",
+    "tailwindcss": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "esbuild": "^0.28.1",
+    "happy-dom": "^20.10.6",
+    "typescript": "^5.9.3",
+    "vite": "^6.0.5",
+    "vitest": "^4.1.9"
+  }
+}

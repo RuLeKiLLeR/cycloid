@@ -1,0 +1,94 @@
+name: Prod PR Smoke Test Dead-Man Switch
+
+# The prod PR smoke test moved off its old 15-min cron to deploy-triggered smoke
+# runs plus a sparse every-3h liveness heartbeat that does NOT run the smoke (see
+# prod-e2b-verifier.yml). That removed the implicit liveness signal a frequent
+# cron gave us: a silently disabled cron (GitHub auto-disables scheduled
+# workflows after ~60 days of repo inactivity) or a heartbeat that stops firing
+# would otherwise go unnoticed. This watchdog asserts
+# the verifier has actually RUN recently (any conclusion), independent of the
+# verifier's own Slack path. It is itself scheduled, so it shares the same
+# "who watches the watcher" limit - accepted pre-revenue.
+
+on:
+  schedule:
+    - cron: "41 */3 * * *" # every 3h, offset from the verifier's :13 heartbeat
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: prod-e2b-verifier-deadman
+  cancel-in-progress: false
+
+jobs:
+  prod-e2b-verifier-deadman:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    env:
+      # Max tolerated age of the most recent verifier run. The liveness heartbeat
+      # now fires every 3h, and the deadman itself runs every 3h, so one skipped
+      # verifier tick is a ~6h gap. 7h tolerates a single missed tick plus GitHub
+      # scheduler jitter without false-alarming, while still catching a truly dead
+      # cron (two consecutive missed ticks = ~9h > 7h alarms).
+      MAX_AGE_HOURS: "7"
+      WORKFLOW_FILE: prod-e2b-verifier.yml
+    steps:
+      - name: Check last verifier run age
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          LAST_RUN_JSON="$(gh api "/repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=1" \
+            --jq '.workflow_runs[0] // empty')"
+
+          if [ -z "$LAST_RUN_JSON" ]; then
+            CREATED_AT=""
+            LAST_RUN_HTML=""
+          else
+            CREATED_AT="$(echo "$LAST_RUN_JSON" | jq -r '.created_at')"
+            LAST_RUN_HTML="$(echo "$LAST_RUN_JSON" | jq -r '.html_url')"
+          fi
+
+          # Compare raw seconds so the threshold is exact: floor-dividing to whole
+          # hours before the check would push the effective alert point out to
+          # MAX_AGE_HOURS+1 (a run dark for 4h01m floors to 4h and passes -le 4).
+          NOW_EPOCH="$(date -u +%s)"
+          MAX_AGE_SECONDS=$(( MAX_AGE_HOURS * 3600 ))
+          if [ -n "$CREATED_AT" ]; then
+            LAST_EPOCH="$(date -u -d "$CREATED_AT" +%s)"
+            AGE_SECONDS=$(( NOW_EPOCH - LAST_EPOCH ))
+          else
+            # No run found at all: a clearly-stale sentinel so the alert reads
+            # sensibly rather than coincidentally near the threshold.
+            AGE_SECONDS=999999
+          fi
+          AGE_HOURS=$(( AGE_SECONDS / 3600 ))
+
+          echo "Most recent ${WORKFLOW_FILE} run: created_at=${CREATED_AT:-<none>} age=${AGE_HOURS}h (${AGE_SECONDS}s, max ${MAX_AGE_HOURS}h)"
+
+          if [ "$AGE_SECONDS" -le "$MAX_AGE_SECONDS" ]; then
+            echo "Verifier is alive."
+            exit 0
+          fi
+
+          echo "::error::No prod PR smoke test run in ${AGE_HOURS}h (max ${MAX_AGE_HOURS}h) - the smoke test may be silently disabled."
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            DETAIL="last run: ${CREATED_AT:-none found}"
+            if [ -n "$LAST_RUN_HTML" ]; then DETAIL="${DETAIL} (<${LAST_RUN_HTML}|view>)"; fi
+            PAYLOAD=$(jq -n \
+              --arg text ":rotating_light: *Prod PR smoke test appears dead*
+          No \`${WORKFLOW_FILE}\` run in the last ${AGE_HOURS}h (threshold ${MAX_AGE_HOURS}h). The every-3h liveness heartbeat may be disabled or broken.
+          ${DETAIL} | <${RUN_URL}|dead-man switch run>
+          cc <@U0AHT782S65> <@U0AHJCUSM70>" \
+              '{text: $text}')
+            curl -s -X POST "$SLACK_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              -d "$PAYLOAD"
+          fi
+          exit 1

@@ -1,0 +1,100 @@
+# Full-stack dogfood compose for cycloid-on-cycloid.
+#
+# `cycloid-app start` uses this file to boot the local control-plane worker and
+# Vite UI inside the sandbox. The API startup applies local D1 migrations and
+# seeds a dogfood user/session so `cycloid-app auth` can produce
+# usable Playwright storage state without depending on the production control
+# plane or a developer-only .dev.vars file.
+
+x-dogfood-service: &dogfood-service
+  build:
+    context: .
+    dockerfile: Dockerfile.dogfood-runtime
+  working_dir: /workspace/repo
+  volumes:
+    - .:/workspace/repo
+    - dogfood-node-modules:/workspace/repo/node_modules
+    - dogfood-cli-node-modules:/workspace/repo/apps/cli/node_modules
+    - dogfood-control-plane-worker-node-modules:/workspace/repo/apps/control-plane-worker/node_modules
+    - dogfood-sandbox-bridge-node-modules:/workspace/repo/apps/sandbox-bridge/node_modules
+    - dogfood-sandbox-e2b-node-modules:/workspace/repo/apps/sandbox-e2b/node_modules
+    - dogfood-ui-node-modules:/workspace/repo/apps/ui/node_modules
+    - dogfood-wrangler-state:/workspace/repo/apps/control-plane-worker/.wrangler
+  environment:
+    DOGFOOD_SESSION_TOKEN: ${DOGFOOD_SESSION_TOKEN:-}
+    DOGFOOD_DEFAULT_REPO: ${DOGFOOD_DEFAULT_REPO:-trycycloid/cycloid}
+    ARCANIST_ADMIN_TOKEN: ${ARCANIST_ADMIN_TOKEN:-}
+    CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
+    E2B_API_KEY: ${E2B_API_KEY:-}
+    E2B_SANDBOX_TEMPLATE: ${E2B_SANDBOX_TEMPLATE:-}
+    GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+    GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}
+    GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+    GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+    GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+    DOGFOOD_GITHUB_TOKEN: ${DOGFOOD_GITHUB_TOKEN:-}
+    GITHUB_USER_TOKEN: ${GITHUB_USER_TOKEN:-}
+    NGROK_DOMAIN: ${NGROK_DOMAIN:-}
+    NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    NGROK_AUTH_TOKEN: ${NGROK_AUTH_TOKEN:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_API_KEY_FOR_LOCAL_DEV: ${OPENAI_API_KEY_FOR_LOCAL_DEV:-}
+    OPENAI_API_KEY_INTERNAL_REVIEW: ${OPENAI_API_KEY_INTERNAL_REVIEW:-}
+    ARCANIST_OPENAI_API_KEY: ${ARCANIST_OPENAI_API_KEY:-}
+    SANDBOX_CALLBACK_SECRET: ${SANDBOX_CALLBACK_SECRET:-}
+    SANDBOX_RUNTIME_CLEANUP_SECRET: ${SANDBOX_RUNTIME_CLEANUP_SECRET:-}
+    TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
+
+services:
+  deps:
+    <<: *dogfood-service
+    command: ["bash", "scripts/dogfood-runtime.sh", "deps"]
+
+  api:
+    <<: *dogfood-service
+    depends_on:
+      deps:
+        condition: service_completed_successfully
+    command: ["bash", "scripts/dogfood-runtime.sh", "api"]
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "node", "scripts/dogfood-healthcheck.mjs"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  ui:
+    <<: *dogfood-service
+    depends_on:
+      deps:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    command: ["bash", "scripts/dogfood-runtime.sh", "ui"]
+    environment:
+      DOGFOOD_SESSION_TOKEN: ${DOGFOOD_SESSION_TOKEN:-}
+      VITE_API_URL: http://api:3000
+      VITE_AUTH_URL: http://api:3000
+    expose:
+      - "5173"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5173/auth/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+volumes:
+  dogfood-node-modules:
+  dogfood-cli-node-modules:
+  dogfood-control-plane-worker-node-modules:
+  dogfood-sandbox-bridge-node-modules:
+  dogfood-sandbox-e2b-node-modules:
+  dogfood-ui-node-modules:
+  dogfood-wrangler-state:

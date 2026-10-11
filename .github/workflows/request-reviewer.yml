@@ -1,0 +1,67 @@
+name: Request Reviewer
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  request-reviewer:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Request one reviewer
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const reviewers = [
+              "josiah-arcanist",
+              "jag-arcanist",
+              "shiv-cycloid",
+              "vrn21-arcanist",
+              "jeman-arcanist",
+            ];
+
+            const pullRequest = context.payload.pull_request;
+            const existingReviewers = pullRequest.requested_reviewers ?? [];
+            const existingTeams = pullRequest.requested_teams ?? [];
+            if (existingReviewers.length > 0 || existingTeams.length > 0) {
+              core.info("PR already has a requested reviewer; leaving it unchanged.");
+              return;
+            }
+
+            const author = pullRequest.user.login;
+            const eligibleReviewers = reviewers.filter((reviewer) => reviewer !== author);
+            if (eligibleReviewers.length === 0) {
+              core.notice(`No eligible reviewers remain after excluding PR author ${author}.`);
+              return;
+            }
+
+            const fresh = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullRequest.number,
+            });
+            const freshReviewers = fresh.data.requested_reviewers ?? [];
+            const freshTeams = fresh.data.requested_teams ?? [];
+            if (freshReviewers.length > 0 || freshTeams.length > 0) {
+              core.info("PR already has a requested reviewer; leaving it unchanged.");
+              return;
+            }
+
+            const reviewer = eligibleReviewers[Math.floor(Math.random() * eligibleReviewers.length)];
+
+            core.info(`Requesting ${reviewer} for PR #${pullRequest.number}.`);
+            await github.rest.pulls.requestReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pullRequest.number,
+              reviewers: [reviewer],
+            });

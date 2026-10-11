@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify PR Before Merge"
+  short_description: "Verify PRs or local changes in test"
+  default_prompt: "Use $verify-pr-before-merge to verify this unmerged PR or local-only change end to end before merge: <PR URL, PR number, or local>"

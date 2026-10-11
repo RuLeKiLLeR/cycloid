@@ -1,0 +1,77 @@
+{
+  "schema_version": "memory_review_bot_fixture_v1",
+  "fixture_id": "linear-webhook-excludes-slack-delivery",
+  "fixture_source": "production",
+  "prompt": {
+    "session_id": "e73b8b4a-7b02-455e-a83b-7002a159f21a",
+    "prompt_id": "production-bootstrap-feedback",
+    "task_summary": "Investigate dropped Linear webhook triggers; Slack session delivery memories should not be credited.",
+    "bounded_prompt": "Find why Linear webhook triggers were dropped and fix the Linear webhook path.",
+    "outcome_summary": "The returned Slack delivery memories were adjacent operational knowledge but not applicable to the Linear webhook trigger failure."
+  },
+  "returned_memories": [
+    {
+      "memory_id": "mf_b77d63ceb513cf537f1125e1c133bdbaea9068c46db1e98617496579c913c838",
+      "source": "company_bootstrap",
+      "rank": 3,
+      "score": 0.74,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Slack-originated sessions need installed-workspace token routing and concise delivery summaries."
+    },
+    {
+      "memory_id": "mf_5ed511772dcf55102973b7644d09a7814c9e6496514360d5e90e652dc3385c4c",
+      "source": "company_bootstrap",
+      "rank": 4,
+      "score": 0.7,
+      "lifecycle_state": "active",
+      "scope": "repo:trycycloid/cycloid",
+      "content_excerpt": "Completion notifications should choose Slack channel and fallback text from session delivery state."
+    }
+  ],
+  "evidence": [
+    {
+      "evidence_id": "ev_prompt_linear_webhook",
+      "kind": "prompt",
+      "source_ref": "session prompt summary",
+      "snippet": "The prompt scope was dropped Linear webhook triggers, not Slack session delivery or completion posting."
+    },
+    {
+      "evidence_id": "ev_feedback_slack_false_positive",
+      "kind": "slack",
+      "source_ref": "https://trycycloid.slack.com/archives/C0B9G5TCATB/p1781294378786489",
+      "snippet": "Memory feedback identified the Slack session and completion memories at ranks 3 and 4 as false positives for this Linear webhook task."
+    },
+    {
+      "evidence_id": "ev_memory_slack_delivery_topic",
+      "kind": "memory",
+      "snippet": "Both returned memories describe Slack delivery behavior, while the task was about Linear webhook trigger ingestion."
+    }
+  ],
+  "expected": {
+    "prompt_outcome": "false_positive",
+    "evidence_ids": ["ev_prompt_linear_webhook", "ev_feedback_slack_false_positive"],
+    "memory_results": [
+      {
+        "memory_id": "mf_b77d63ceb513cf537f1125e1c133bdbaea9068c46db1e98617496579c913c838",
+        "relevance": "irrelevant",
+        "usefulness": "not_useful",
+        "effect": "neutral",
+        "lifecycle_state": "active",
+        "root_causes": ["retrieval"],
+        "evidence_ids": ["ev_prompt_linear_webhook", "ev_memory_slack_delivery_topic"],
+        "rationale": "Slack token-routing knowledge did not diagnose dropped Linear webhook triggers."
+      },
+      {
+        "memory_id": "mf_5ed511772dcf55102973b7644d09a7814c9e6496514360d5e90e652dc3385c4c",
+        "relevance": "irrelevant",
+        "usefulness": "not_useful",
+        "effect": "neutral",
+        "lifecycle_state": "active",
+        "root_causes": ["retrieval"],
+        "evidence_ids": ["ev_prompt_linear_webhook", "ev_memory_slack_delivery_topic"],
+        "rationale": "Completion-posting guidance was not useful for the Linear trigger failure."
+      }
+    ]
+  }
+}

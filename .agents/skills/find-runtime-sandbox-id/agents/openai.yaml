@@ -1,0 +1,4 @@
+interface:
+  display_name: "Find Runtime Sandbox ID"
+  short_description: "Resolve a session's provider E2B runtime_sandbox_id"
+  default_prompt: "Use $find-runtime-sandbox-id to find the provider-facing runtime_sandbox_id / E2B sandbox id for this Cycloid session from the control-plane source of truth, not the internal bridge sandboxId."

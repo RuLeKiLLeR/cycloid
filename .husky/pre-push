@@ -1,0 +1,34 @@
+# Block direct pushes to main — use a PR instead
+while read local_ref local_sha remote_ref remote_sha; do
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    echo "Direct push to main is blocked. Please use a pull request."
+    exit 1
+  fi
+done
+
+# Reinstall deps if node_modules has drifted from package-lock.json (e.g. a
+# teammate's lockfile change arrived via pull/sync but was never installed), so
+# the lint/typecheck below fail on real problems instead of missing modules.
+node scripts/ensure-deps.mjs
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "Dependency install failed. Resolve the npm error above before pushing."
+  exit 1
+fi
+
+# Lint all TypeScript files changed on this branch compared to main.
+bash scripts/lint-changed-ts.sh
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "Lint failed. Fix errors above before pushing."
+  exit 1
+fi
+
+# Typecheck the project before push
+echo "Running typecheck before push..."
+npm run typecheck
+if [ $? -ne 0 ]; then
+  echo ""
+  echo "Typecheck failed. Fix type errors above before pushing."
+  exit 1
+fi

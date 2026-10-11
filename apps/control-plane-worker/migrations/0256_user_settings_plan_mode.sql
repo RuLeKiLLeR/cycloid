@@ -1,0 +1,1 @@
+ALTER TABLE user_settings ADD COLUMN plan_mode INTEGER NOT NULL DEFAULT 0;
